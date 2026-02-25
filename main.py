@@ -18,38 +18,38 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 TD_API_KEY = os.getenv("TD_API_KEY", "")
 
-AUTO_INTERVAL_MINUTES = int(os.getenv("AUTO_INTERVAL_MINUTES", "60"))
+AUTO_INTERVAL_MINUTES = int(os.getenv("AUTO_INTERVAL_MINUTES", "15"))
 MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "5"))
-
-# Сколько сигналов хотим в день (UTC)
 MIN_SIGNALS_PER_DAY = int(os.getenv("MIN_SIGNALS_PER_DAY", "3"))
 
-# Риск/параметры
+# RR and SL multipliers
 RR_STRICT = float(os.getenv("RR_STRICT", "2.1"))
 RR_BALANCED = float(os.getenv("RR_BALANCED", "1.85"))
+RR_FLOW = float(os.getenv("RR_FLOW", "1.6"))
 
 SL_ATR_MULT_STRICT = float(os.getenv("SL_ATR_MULT_STRICT", "1.9"))
 SL_ATR_MULT_BALANCED = float(os.getenv("SL_ATR_MULT_BALANCED", "1.65"))
+SL_ATR_MULT_FLOW = float(os.getenv("SL_ATR_MULT_FLOW", "1.5"))
 
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "150"))  # чуть меньше, чтобы добирать до 3/день
+# Cooldowns (minutes)
+COOLDOWN_STRICT = int(os.getenv("COOLDOWN_STRICT", "150"))
+COOLDOWN_BALANCED = int(os.getenv("COOLDOWN_BALANCED", "120"))
+COOLDOWN_FLOW = int(os.getenv("COOLDOWN_FLOW", "90"))
 
-# Сессии (UTC)
+# Sessions (UTC)
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
 
-# Новости blackout (UTC интервалы)
 NEWS_BLACKOUT_UTC = os.getenv("NEWS_BLACKOUT_UTC", "").strip()
 
-INSTRUMENTS = ["EUR/USD", "XAU/USD"]  # строго
+INSTRUMENTS = ["EUR/USD", "XAU/USD"]
 
-# Таймфреймы
 TF_4H = "4h"
 TF_1H = "1h"
 TF_15 = "15min"
 TF_5 = "5min"
 TF_MONITOR = "5min"
 
-# Кол-во свечей
 N_4H = 350
 N_1H = 650
 N_15 = 900
@@ -57,6 +57,7 @@ N_5 = 1200
 N_MONITOR = 450
 
 DB_PATH = "bot.db"
+
 
 # =========================
 # Helpers
@@ -98,12 +99,12 @@ def sha16(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 def price_sanity_ok(symbol: str, price: float) -> bool:
-    # широкие диапазоны, чтобы отсеять мусорные котировки
     if symbol == "EUR/USD":
         return 0.8 <= price <= 1.6
     if symbol == "XAU/USD":
         return 1000 <= price <= 10000
     return True
+
 
 # =========================
 # DB
@@ -209,6 +210,7 @@ def db_stats(days: int = 7) -> dict:
     out["WINRATE"] = (out["TP"] / closed * 100.0) if closed > 0 else 0.0
     return out
 
+
 # =========================
 # Market data (TwelveData)
 # =========================
@@ -237,15 +239,16 @@ async def fetch_td(session: aiohttp.ClientSession, symbol: str, interval: str, o
     if not values:
         raise RuntimeError(f"No candles for {symbol} {interval}")
     candles: List[Candle] = []
-    for v in reversed(values):  # oldest -> newest
+    for v in reversed(values):
         t = datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc)
         candles.append(Candle(
             t=t, o=float(v["open"]), h=float(v["high"]), l=float(v["low"]), c=float(v["close"])
         ))
     return candles
 
+
 # =========================
-# Indicators (pure python)
+# Indicators
 # =========================
 def ema_list(closes: List[float], period: int) -> List[float]:
     out = [float("nan")] * len(closes)
@@ -271,11 +274,13 @@ def rsi_list(closes: List[float], period: int = 14) -> List[float]:
         losses.append(max(-d, 0.0))
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
+
     def calc(g, l):
         if l == 0:
             return 100.0
         rs = g / l
         return 100.0 - (100.0 / (1.0 + rs))
+
     out[period] = calc(avg_gain, avg_loss)
     for i in range(period+1, len(closes)):
         d = closes[i] - closes[i-1]
@@ -316,38 +321,33 @@ def calc_pack(candles: List[Candle]) -> dict:
         "atr14": atr_list(candles, 14),
     }
 
+
 # =========================
-# Strategy parts
+# Strategy
 # =========================
 def bias_4h(c4: List[Candle]) -> Optional[str]:
     p = calc_pack(c4)
-    i = len(c4) - 1
-    if i < 201:
+    if len(c4) < 220:
         return None
-    price = p["closes"][i]
-    ema50 = p["ema50"][i]
-    ema200 = p["ema200"][i]
-    ema50_prev = p["ema50"][i-1]
+    price = p["closes"][-1]
+    ema50 = p["ema50"][-1]
+    ema200 = p["ema200"][-1]
+    ema50_prev = p["ema50"][-2]
     if any(x != x for x in [ema50, ema200, ema50_prev]):
         return None
-
-    # если тренд слабый
     if abs(ema50 - ema200) / max(1e-12, price) < 0.001:
         return None
-
-    slope_up = ema50 > ema50_prev
-    slope_down = ema50 < ema50_prev
-
-    if ema50 > ema200 and price > ema50 and slope_up:
+    if ema50 > ema200 and price > ema50 and ema50 > ema50_prev:
         return "LONG"
-    if ema50 < ema200 and price < ema50 and slope_down:
+    if ema50 < ema200 and price < ema50 and ema50 < ema50_prev:
         return "SHORT"
     return None
 
 def vol_ok(atr_val: float, price: float, threshold: float) -> bool:
     return (atr_val == atr_val) and atr_val > 0 and (atr_val / max(1e-12, price)) > threshold
 
-def setup_1h(c1: List[Candle], direction: str, strict: bool) -> bool:
+def setup_1h(c1: List[Candle], direction: str, mode: str) -> bool:
+    # mode: STRICT / BALANCED / FLOW
     p = calc_pack(c1)
     price = p["closes"][-1]
     ema50 = p["ema50"][-1]
@@ -356,56 +356,32 @@ def setup_1h(c1: List[Candle], direction: str, strict: bool) -> bool:
     if any(x != x for x in [ema50, r, a]):
         return False
 
-    # боковик / тихий рынок
-    vol_thr = 0.00050 if strict else 0.00035
+    # чем мягче режим - тем меньше порог волатильности
+    vol_thr = 0.00050 if mode == "STRICT" else (0.00038 if mode == "BALANCED" else 0.00030)
     if not vol_ok(a, price, vol_thr):
         return False
 
     if direction == "LONG":
-        # делаем чуть строже, чтобы не брать “выдыхание”
-        r_ok = (55 <= r <= 70) if strict else (52 <= r <= 72)
-        return (price > ema50) and r_ok
+        r_min = 56 if mode == "STRICT" else (52 if mode == "BALANCED" else 49)
+        r_max = 70 if mode == "STRICT" else 72
+        return (price > ema50) and (r_min <= r <= r_max)
     else:
-        r_ok = (30 <= r <= 45) if strict else (28 <= r <= 50)
-        return (price < ema50) and r_ok
+        r_max = 44 if mode == "STRICT" else (50 if mode == "BALANCED" else 53)
+        r_min = 30 if mode != "FLOW" else 28
+        return (price < ema50) and (r_min <= r <= r_max)
 
-def breakout_15m(c15: List[Candle], direction: str, strict: bool) -> bool:
-    # Ключевой апгрейд: вход только после пробоя диапазона.
-    # STRICT: пробой high/low последних 8 свечей (без текущей)
-    # BALANCED: пробой последних 5 свечей
-    n = 8 if strict else 5
+def breakout_15m(c15: List[Candle], direction: str, mode: str) -> bool:
+    # STRICT: 8 свечей, BALANCED: 5, FLOW: 3
+    n = 8 if mode == "STRICT" else (5 if mode == "BALANCED" else 3)
     if len(c15) < n + 2:
         return False
-    prev = c15[-(n+1):-1]  # предыдущие n свечей
+    prev = c15[-(n+1):-1]
     last = c15[-1]
     prev_high = max(c.h for c in prev)
     prev_low = min(c.l for c in prev)
-
-    if direction == "LONG":
-        return last.c > prev_high
-    else:
-        return last.c < prev_low
-
-def confirm_5m_impulse(c5: List[Candle], direction: str, strict: bool) -> bool:
-    # Второй главный апгрейд: импульс на 5m.
-    # Требуем направленную свечу + range > ATR5*k
-    p = calc_pack(c5)
-    atr5 = p["atr14"][-1]
-    if atr5 != atr5 or atr5 <= 0:
-        return False
-    last = c5[-1]
-    rng = last.h - last.l
-    k = 1.10 if strict else 0.90
-
-    if direction == "LONG":
-        dir_ok = last.c > last.o
-    else:
-        dir_ok = last.c < last.o
-
-    return dir_ok and (rng >= atr5 * k)
+    return (last.c > prev_high) if direction == "LONG" else (last.c < prev_low)
 
 def ema_confirm_5m(c5: List[Candle], direction: str) -> bool:
-    # базовая проверка положения относительно EMA50 на 5m
     p = calc_pack(c5)
     price = p["closes"][-1]
     ema50 = p["ema50"][-1]
@@ -414,10 +390,21 @@ def ema_confirm_5m(c5: List[Candle], direction: str) -> bool:
         return False
     slope_up = ema50 > ema50_prev
     slope_down = ema50 < ema50_prev
-    if direction == "LONG":
-        return (price > ema50) and slope_up
-    else:
-        return (price < ema50) and slope_down
+    return (price > ema50 and slope_up) if direction == "LONG" else (price < ema50 and slope_down)
+
+def impulse_5m(c5: List[Candle], direction: str, mode: str) -> bool:
+    p = calc_pack(c5)
+    atr5 = p["atr14"][-1]
+    if atr5 != atr5 or atr5 <= 0:
+        return False
+    last = c5[-1]
+    rng = last.h - last.l
+
+    # STRICT: 1.1 ATR, BALANCED: 0.9 ATR, FLOW: 0.65 ATR
+    k = 1.10 if mode == "STRICT" else (0.90 if mode == "BALANCED" else 0.65)
+
+    dir_ok = (last.c > last.o) if direction == "LONG" else (last.c < last.o)
+    return dir_ok and (rng >= atr5 * k)
 
 def swing_high(candles: List[Candle], lookback: int = 90) -> Optional[float]:
     if len(candles) < lookback:
@@ -429,40 +416,41 @@ def swing_low(candles: List[Candle], lookback: int = 90) -> Optional[float]:
         return None
     return min(c.l for c in candles[-lookback:])
 
-def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle], strict: bool) -> Optional[dict]:
+def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle], mode: str) -> Optional[dict]:
     entry = c5[-1].c
     if not price_sanity_ok(symbol, entry):
         return None
 
     created = utc_now().isoformat()
-
-    # SL/TP по ATR(15m)
     p15 = calc_pack(c15)
     atr15 = p15["atr14"][-1]
     if atr15 != atr15 or atr15 <= 0:
         return None
 
-    rr = RR_STRICT if strict else RR_BALANCED
-    mult = SL_ATR_MULT_STRICT if strict else SL_ATR_MULT_BALANCED
+    if mode == "STRICT":
+        rr, mult, score, cooldown = RR_STRICT, SL_ATR_MULT_STRICT, 9.5, COOLDOWN_STRICT
+    elif mode == "BALANCED":
+        rr, mult, score, cooldown = RR_BALANCED, SL_ATR_MULT_BALANCED, 8.5, COOLDOWN_BALANCED
+    else:
+        rr, mult, score, cooldown = RR_FLOW, SL_ATR_MULT_FLOW, 7.8, COOLDOWN_FLOW
+
     sl_dist = atr15 * mult
 
-    # не входить “в стену”: проверка swing уровней
     sh = swing_high(c15, 90)
     slw = swing_low(c15, 90)
 
     if direction == "LONG":
         sl = entry - sl_dist
         tp = entry + sl_dist * rr
-        # если ближайший high слишком близко — пропуск (и в balanced тоже, но мягче)
         if sh is not None and sh < tp:
-            near = (sh - entry) < (sl_dist * (0.85 if strict else 0.65))
+            near = (sh - entry) < (sl_dist * (0.85 if mode != "FLOW" else 0.55))
             if near:
                 return None
     else:
         sl = entry + sl_dist
         tp = entry - sl_dist * rr
         if slw is not None and slw > tp:
-            near = (entry - slw) < (sl_dist * (0.85 if strict else 0.65))
+            near = (entry - slw) < (sl_dist * (0.85 if mode != "FLOW" else 0.55))
             if near:
                 return None
 
@@ -471,9 +459,6 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
     sl_r = round(sl, digits)
     tp_r = round(tp, digits)
 
-    # Score: STRICT=9.5, BALANCED=8.5 (для различения режимов)
-    score = 9.5 if strict else 8.5
-    mode = "STRICT" if strict else "BALANCED"
     h = sha16(f"{symbol}|{direction}|{entry_r}|{sl_r}|{tp_r}|{mode}")
 
     return {
@@ -486,6 +471,7 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
         "score": score,
         "mode": mode,
         "hash16": h,
+        "cooldown": cooldown,
     }
 
 def format_signal(sig: dict) -> str:
@@ -501,7 +487,7 @@ def format_signal(sig: dict) -> str:
         f"SL: {sig['sl']}\n"
         f"Оценка (0–10): {sig['score']}  |  Режим: {sig['mode']}\n"
         f"R:R ≈ {rr:.2f}  |  SL distance: {sl_dist:.5f}\n\n"
-        f"Управление сделкой (рекомендация):\n"
+        f"Управление сделкой:\n"
         f"• На +1R → SL в безубыток\n"
         f"• На +1.5R → закрыть 50%\n"
         f"• Остаток трейлить по EMA20 (15m)\n\n"
@@ -509,7 +495,7 @@ def format_signal(sig: dict) -> str:
         f"⚠️ Это сигнал по правилам, не гарантия."
     )
 
-def cooldown_ok(symbol: str) -> bool:
+def cooldown_ok(symbol: str, cooldown_minutes: int) -> bool:
     last = db_last_signal(symbol)
     if not last:
         return True
@@ -517,7 +503,7 @@ def cooldown_ok(symbol: str) -> bool:
         t = datetime.fromisoformat(last["created_utc"])
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
-        return (utc_now() - t) >= timedelta(minutes=COOLDOWN_MINUTES)
+        return (utc_now() - t) >= timedelta(minutes=cooldown_minutes)
     except Exception:
         return True
 
@@ -525,68 +511,71 @@ def repeated(symbol: str, hash16: str) -> bool:
     last = db_last_signal(symbol)
     return bool(last and last["hash16"] == hash16)
 
-# =========================
-# Analysis pipeline
-# =========================
-async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, strict: bool) -> Optional[dict]:
+async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Optional[dict]:
     now = utc_now()
-    if not in_session_window(now):
-        return None
-    if in_blackout(now):
-        return None
-    if not cooldown_ok(symbol):
+    if not in_session_window(now) or in_blackout(now):
         return None
 
-    # 1) 4H bias
+    # 4H bias
     c4 = await fetch_td(session, symbol, TF_4H, N_4H)
     direction = bias_4h(c4)
     if direction is None:
         return None
 
-    # 2) 1H setup
+    # 1H setup
     c1 = await fetch_td(session, symbol, TF_1H, N_1H)
-    if not setup_1h(c1, direction, strict):
+    if not setup_1h(c1, direction, mode):
         return None
 
-    # 3) 15m breakout (вместо слабого триггера)
+    # 15m breakout
     c15 = await fetch_td(session, symbol, TF_15, N_15)
-    if not breakout_15m(c15, direction, strict):
+    if not breakout_15m(c15, direction, mode):
         return None
 
-    # 4) 5m подтверждение: EMA + импульс
+    # 5m confirms
     c5 = await fetch_td(session, symbol, TF_5, N_5)
     if not ema_confirm_5m(c5, direction):
         return None
-    if not confirm_5m_impulse(c5, direction, strict):
+    if not impulse_5m(c5, direction, mode):
         return None
 
-    sig = build_signal(symbol, direction, c5, c15, strict)
+    sig = build_signal(symbol, direction, c5, c15, mode)
     if not sig:
+        return None
+    if not cooldown_ok(symbol, sig["cooldown"]):
         return None
     if repeated(symbol, sig["hash16"]):
         return None
     return sig
 
-async def run_analysis(send_only_signals: bool) -> str:
-    today_count = db_count_today()
-    need_more = today_count < MIN_SIGNALS_PER_DAY
-    strict = not need_more  # если не добрали, включаем BALANCED
+def choose_mode() -> str:
+    # если сегодня сигналов мало — опускаем строгость
+    c = db_count_today()
+    if c >= MIN_SIGNALS_PER_DAY:
+        return "STRICT"
+    # добор
+    if c == 0:
+        return "FLOW"
+    if c == 1:
+        return "BALANCED"
+    return "BALANCED"
 
+async def run_analysis(send_only_signals: bool) -> str:
+    mode = choose_mode()
     try:
         async with aiohttp.ClientSession() as session:
             best = None
             for sym in INSTRUMENTS:
-                sig = await analyze_symbol(session, sym, strict=strict)
+                sig = await analyze_symbol(session, sym, mode)
                 if sig:
                     best = sig if best is None or sig["score"] > best["score"] else best
 
             if not best:
                 if send_only_signals:
                     return ""
-                mode = "STRICT" if strict else "BALANCED"
                 return (
                     f"🔎 Анализ выполнен ({utc_now().strftime('%Y-%m-%d %H:%M UTC')})\n"
-                    f"Сильных сетапов нет. Режим: {mode}. Сегодня: {today_count}/{MIN_SIGNALS_PER_DAY}"
+                    f"Сильных сетапов нет. Режим: {mode}. Сегодня: {db_count_today()}/{MIN_SIGNALS_PER_DAY}"
                 )
 
             db_add_signal(best)
@@ -597,10 +586,7 @@ async def run_analysis(send_only_signals: bool) -> str:
             return ""
         return f"⚠️ Ошибка анализа: {e}"
 
-# =========================
-# Monitor TP/SL for OPEN signals
-# =========================
-def candle_hits(sig: dict, candles: List[Candle]) -> Optional[str]:
+def candle_hits(sig: dict, candles: List['Candle']) -> Optional[str]:
     tp = float(sig["tp"])
     sl = float(sig["sl"])
     direction = sig["direction"]
@@ -608,15 +594,15 @@ def candle_hits(sig: dict, candles: List[Candle]) -> Optional[str]:
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
 
-    relevant = [c for c in candles if c.t >= created]
-    for c in relevant:
+    for c in candles:
+        if c.t < created:
+            continue
         if direction == "LONG":
             hit_tp = c.h >= tp
             hit_sl = c.l <= sl
         else:
             hit_tp = c.l <= tp
             hit_sl = c.h >= sl
-
         if hit_tp and hit_sl:
             return "UNKNOWN"
         if hit_tp:
@@ -664,33 +650,11 @@ def on_start(msg):
     bot.send_message(
         msg.chat.id,
         "✅ Бот запущен.\n"
-        "Фильтр: 4H → 1H → 15m(BREAKOUT) → 5m(EMA+IMPULSE) по EUR/USD и XAU/USD.\n"
+        "Фильтр: 4H → 1H → 15m(BREAKOUT) → 5m(EMA+IMPULSE)\n"
+        f"Инструменты: EUR/USD и XAU/USD\n"
         f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
-        f"Цель: минимум {MIN_SIGNALS_PER_DAY} сигнал(а) в день (авто BALANCED при нехватке).\n"
-        "Нажми «📊 Сигнал», чтобы сделать анализ сейчас.",
-        reply_markup=kb_main()
-    )
-
-@bot.message_handler(commands=["last"])
-def on_last(msg):
-    if not owner_guard(msg.from_user.id):
-        bot.reply_to(msg, "⛔️")
-        return
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""
-      SELECT created_utc, symbol, direction, entry, sl, tp, score, mode, status
-      FROM signals ORDER BY id DESC LIMIT 1
-    """)
-    r = cur.fetchone()
-    con.close()
-    if not r:
-        bot.send_message(msg.chat.id, "Пока сигналов нет.", reply_markup=kb_main())
-        return
-    created, sym, d, e, sl, tp, sc, mode, st = r
-    bot.send_message(
-        msg.chat.id,
-        f"Последний сигнал:\n{created}\n{sym} {d}\nEntry {e} | SL {sl} | TP {tp}\nScore {sc} | Mode {mode} | Status {st}",
+        f"Авто-анализ каждые {AUTO_INTERVAL_MINUTES} минут.\n"
+        f"Цель: минимум {MIN_SIGNALS_PER_DAY}/день (режимы STRICT/BALANCED/FLOW).\n",
         reply_markup=kb_main()
     )
 
@@ -699,17 +663,14 @@ def on_callback(call):
     if not owner_guard(call.from_user.id):
         bot.answer_callback_query(call.id, "⛔️", show_alert=True)
         return
-
     if call.data == "force_signal":
         bot.answer_callback_query(call.id, "Анализирую...")
         text = asyncio.run(run_analysis(send_only_signals=False))
         bot.send_message(call.message.chat.id, text, reply_markup=kb_main())
-
     elif call.data == "today":
         bot.answer_callback_query(call.id)
         c = db_count_today()
         bot.send_message(call.message.chat.id, f"📈 Сегодня сигналов: {c}/{MIN_SIGNALS_PER_DAY}", reply_markup=kb_main())
-
     elif call.data == "stats":
         bot.answer_callback_query(call.id)
         s = db_stats(days=7)
@@ -722,9 +683,7 @@ def on_callback(call):
             reply_markup=kb_main()
         )
 
-# =========================
-# Scheduler jobs (sync wrappers)
-# =========================
+# Scheduler wrappers
 def job_analysis():
     try:
         text = asyncio.run(run_analysis(send_only_signals=True))
