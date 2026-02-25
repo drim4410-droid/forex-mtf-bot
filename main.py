@@ -1,15 +1,15 @@
 import os
 import asyncio
-import hashlib
-from datetime import datetime, timezone, timedelta
-
 import aiohttp
-import pandas as pd
-import numpy as np
+import sqlite3
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Tuple, Dict
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import CommandStart
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # =========================
@@ -19,73 +19,211 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 TD_API_KEY = os.getenv("TD_API_KEY", "")
 
-# Настройки стратегии (строже = меньше сигналов, выше качество)
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "8.0"))  # 0..10 (строгий порог)
-RR = float(os.getenv("RR", "2.0"))                            # TP = SL * RR
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.8"))          # SL = ATR(15m) * mult
+AUTO_INTERVAL_MINUTES = int(os.getenv("AUTO_INTERVAL_MINUTES", "60"))   # авто-анализ
+MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "5"))  # монитор TP/SL
 
-# Ограничения, чтобы бот не спамил
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "180"))  # 3 часа на инструмент
-AUTO_INTERVAL_MINUTES = int(os.getenv("AUTO_INTERVAL_MINUTES", "60"))
+# STRICT/BALANCED
+STRICT_THRESHOLD = float(os.getenv("STRICT_THRESHOLD", "8.0"))
+BALANCED_THRESHOLD = float(os.getenv("BALANCED_THRESHOLD", "7.0"))
+MIN_SIGNALS_PER_DAY = int(os.getenv("MIN_SIGNALS_PER_DAY", "3"))
 
-INSTRUMENTS = ["EUR/USD", "XAU/USD"]  # TwelveData symbols
+RR_STRICT = float(os.getenv("RR_STRICT", "2.0"))
+RR_BALANCED = float(os.getenv("RR_BALANCED", "1.7"))
 
-# Таймфреймы top-down
+SL_ATR_MULT_STRICT = float(os.getenv("SL_ATR_MULT_STRICT", "1.8"))
+SL_ATR_MULT_BALANCED = float(os.getenv("SL_ATR_MULT_BALANCED", "1.6"))
+
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "180"))  # 3 часа
+
+# Сессии (UTC)
+SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))   # 07:00 UTC
+SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))      # 21:00 UTC
+
+# Новости: интервалы blackout в UTC через запятую
+# пример: 2026-02-25T13:20/2026-02-25T14:10,2026-02-26T07:55/2026-02-26T09:00
+NEWS_BLACKOUT_UTC = os.getenv("NEWS_BLACKOUT_UTC", "").strip()
+
+INSTRUMENTS = ["EUR/USD", "XAU/USD"]  # строго только эти
+
+# Таймфреймы
 TF_4H = "4h"
 TF_1H = "1h"
 TF_15 = "15min"
 TF_5 = "5min"
+TF_MONITOR = "5min"
 
-CANDLES_4H = 350
-CANDLES_1H = 500
-CANDLES_15 = 800
-CANDLES_5 = 1200
+# Кол-во свечей (с запасом)
+N_4H = 350
+N_1H = 600
+N_15 = 900
+N_5 = 1200
+N_MONITOR = 400  # для проверки TP/SL
+
+DB_PATH = "bot.db"
 
 # =========================
-# Security
+# Helpers
 # =========================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 def deny_text() -> str:
     return "⛔️ Доступ запрещён. Этот бот доступен только владельцу."
 
-# =========================
-# Indicators
-# =========================
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def in_session_window(now_utc: datetime) -> bool:
+    h = now_utc.hour
+    # окно в пределах суток, без перехода через 0
+    return SESSION_START_UTC <= h < SESSION_END_UTC
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / (avg_loss.replace(0, np.nan))
-    return 100 - (100 / (1 + rs))
+def parse_blackouts(s: str) -> List[Tuple[datetime, datetime]]:
+    out = []
+    if not s:
+        return out
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        # format: start/end
+        if "/" not in p:
+            continue
+        a, b = p.split("/", 1)
+        try:
+            start = datetime.fromisoformat(a.replace("Z", "+00:00")).astimezone(timezone.utc)
+            end = datetime.fromisoformat(b.replace("Z", "+00:00")).astimezone(timezone.utc)
+            if end > start:
+                out.append((start, end))
+        except Exception:
+            pass
+    return out
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        (df["high"] - df["low"]),
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
+BLACKOUTS = parse_blackouts(NEWS_BLACKOUT_UTC)
 
-def with_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema50"] = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
-    df["rsi14"] = rsi(df["close"], 14)
-    df["atr14"] = atr(df, 14)
-    return df
+def in_blackout(now_utc: datetime) -> bool:
+    for a, b in BLACKOUTS:
+        if a <= now_utc <= b:
+            return True
+    return False
+
+def sha16(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 # =========================
-# TwelveData fetch
+# DB
 # =========================
-async def fetch_td_candles(session: aiohttp.ClientSession, symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+def db_init():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_utc TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry REAL NOT NULL,
+      sl REAL NOT NULL,
+      tp REAL NOT NULL,
+      score REAL NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,      -- OPEN / TP / SL / UNKNOWN
+      closed_utc TEXT,
+      hash16 TEXT NOT NULL
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_utc)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+    con.commit()
+    con.close()
+
+def db_add_signal(sig: dict):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+      INSERT INTO signals(created_utc, symbol, direction, entry, sl, tp, score, mode, status, hash16)
+      VALUES(?,?,?,?,?,?,?,?,?,?)
+    """, (
+        sig["created_utc"], sig["symbol"], sig["direction"], sig["entry"], sig["sl"], sig["tp"],
+        sig["score"], sig["mode"], "OPEN", sig["hash16"]
+    ))
+    con.commit()
+    con.close()
+
+def db_mark_closed(row_id: int, status: str, closed_utc: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE signals SET status=?, closed_utc=? WHERE id=?", (status, closed_utc, row_id))
+    con.commit()
+    con.close()
+
+def db_last_signal(symbol: str) -> Optional[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+      SELECT id, created_utc, symbol, direction, entry, sl, tp, score, mode, status, hash16
+      FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 1
+    """, (symbol,))
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    keys = ["id","created_utc","symbol","direction","entry","sl","tp","score","mode","status","hash16"]
+    return dict(zip(keys, r))
+
+def db_open_signals() -> List[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+      SELECT id, created_utc, symbol, direction, entry, sl, tp, score, mode, status, hash16
+      FROM signals WHERE status='OPEN' ORDER BY id ASC
+    """)
+    rows = cur.fetchall()
+    con.close()
+    keys = ["id","created_utc","symbol","direction","entry","sl","tp","score","mode","status","hash16"]
+    return [dict(zip(keys, r)) for r in rows]
+
+def db_count_today() -> int:
+    now = utc_now()
+    day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM signals WHERE created_utc >= ?", (day_start.isoformat(),))
+    c = cur.fetchone()[0]
+    con.close()
+    return int(c)
+
+def db_stats(days: int = 7) -> dict:
+    now = utc_now()
+    since = now - timedelta(days=days)
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+      SELECT status, COUNT(*) FROM signals
+      WHERE created_utc >= ?
+      GROUP BY status
+    """, (since.isoformat(),))
+    rows = cur.fetchall()
+    con.close()
+    out = {"OPEN":0,"TP":0,"SL":0,"UNKNOWN":0,"TOTAL":0}
+    for s, c in rows:
+        out[s] = int(c)
+        out["TOTAL"] += int(c)
+    closed = out["TP"] + out["SL"] + out["UNKNOWN"]
+    out["CLOSED"] = closed
+    out["WINRATE"] = (out["TP"] / closed * 100.0) if closed > 0 else 0.0
+    return out
+
+# =========================
+# Market data: TwelveData
+# =========================
+@dataclass
+class Candle:
+    t: datetime
+    o: float
+    h: float
+    l: float
+    c: float
+
+async def fetch_td(session: aiohttp.ClientSession, symbol: str, interval: str, outputsize: int) -> List[Candle]:
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -97,7 +235,6 @@ async def fetch_td_candles(session: aiohttp.ClientSession, symbol: str, interval
     async with session.get(url, params=params, timeout=30) as r:
         data = await r.json()
 
-    # Ошибки TD приходят как {"status":"error","message":"..."}
     if isinstance(data, dict) and data.get("status") == "error":
         raise RuntimeError(f"TwelveData error: {data.get('message')}")
 
@@ -105,37 +242,127 @@ async def fetch_td_candles(session: aiohttp.ClientSession, symbol: str, interval
     if not values:
         raise RuntimeError(f"No candles for {symbol} {interval}")
 
-    rows = []
-    for v in values:
-        # TD возвращает строки; time может быть "YYYY-MM-DD HH:MM:SS"
-        rows.append({
-            "time": pd.to_datetime(v["datetime"]),
-            "open": float(v["open"]),
-            "high": float(v["high"]),
-            "low": float(v["low"]),
-            "close": float(v["close"]),
-            "volume": float(v.get("volume", 0) or 0),
-        })
-
-    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
-    return df
+    # TD returns newest first -> reverse
+    candles = []
+    for v in reversed(values):
+        t = datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc)
+        candles.append(Candle(
+            t=t,
+            o=float(v["open"]),
+            h=float(v["high"]),
+            l=float(v["low"]),
+            c=float(v["close"]),
+        ))
+    return candles
 
 # =========================
-# Multi-timeframe logic
+# Indicators (pure python)
 # =========================
-def bias_4h(df4: pd.DataFrame):
-    df4 = with_indicators(df4)
-    last = df4.iloc[-1]
-    prev = df4.iloc[-2]
+def ema_list(closes: List[float], period: int) -> List[float]:
+    if len(closes) < period:
+        return [float("nan")] * len(closes)
+    k = 2.0 / (period + 1)
+    out = [float("nan")] * len(closes)
+    # start with SMA
+    sma = sum(closes[:period]) / period
+    out[period-1] = sma
+    prev = sma
+    for i in range(period, len(closes)):
+        prev = closes[i] * k + prev * (1 - k)
+        out[i] = prev
+    return out
 
-    price = float(last["close"])
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-    slope_up = float(last["ema50"]) > float(prev["ema50"])
-    slope_down = float(last["ema50"]) < float(prev["ema50"])
+def rsi_list(closes: List[float], period: int = 14) -> List[float]:
+    out = [float("nan")] * len(closes)
+    if len(closes) < period + 1:
+        return out
+    gains = []
+    losses = []
+    for i in range(1, period+1):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    def calc(g, l):
+        if l == 0:
+            return 100.0
+        rs = g / l
+        return 100.0 - (100.0 / (1.0 + rs))
+    out[period] = calc(avg_gain, avg_loss)
+    for i in range(period+1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gain = max(d, 0.0)
+        loss = max(-d, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        out[i] = calc(avg_gain, avg_loss)
+    return out
 
-    # Фильтр "каша"
-    if np.isnan(ema50) or np.isnan(ema200):
+def atr_list(candles: List[Candle], period: int = 14) -> List[float]:
+    out = [float("nan")] * len(candles)
+    if len(candles) < period + 1:
+        return out
+    trs = []
+    for i in range(1, period+1):
+        c = candles[i]
+        prev_close = candles[i-1].c
+        tr = max(c.h - c.l, abs(c.h - prev_close), abs(c.l - prev_close))
+        trs.append(tr)
+    atr = sum(trs) / period
+    out[period] = atr
+    for i in range(period+1, len(candles)):
+        c = candles[i]
+        prev_close = candles[i-1].c
+        tr = max(c.h - c.l, abs(c.h - prev_close), abs(c.l - prev_close))
+        atr = (atr * (period - 1) + tr) / period
+        out[i] = atr
+    return out
+
+# =========================
+# Swing levels (простая проверка "не входить в стену")
+# =========================
+def find_recent_swing_high(candles: List[Candle], lookback: int = 60) -> Optional[float]:
+    if len(candles) < lookback + 5:
+        return None
+    window = candles[-lookback:]
+    highs = [c.h for c in window]
+    return max(highs) if highs else None
+
+def find_recent_swing_low(candles: List[Candle], lookback: int = 60) -> Optional[float]:
+    if len(candles) < lookback + 5:
+        return None
+    window = candles[-lookback:]
+    lows = [c.l for c in window]
+    return min(lows) if lows else None
+
+# =========================
+# Strategy (4H -> 1H -> 15m -> 5m)
+# =========================
+def calc_pack(candles: List[Candle]) -> dict:
+    closes = [c.c for c in candles]
+    e50 = ema_list(closes, 50)
+    e200 = ema_list(closes, 200)
+    r14 = rsi_list(closes, 14)
+    a14 = atr_list(candles, 14)
+    return {"ema50": e50, "ema200": e200, "rsi14": r14, "atr14": a14, "closes": closes}
+
+def bias_4h(c4: List[Candle]) -> Optional[str]:
+    p = calc_pack(c4)
+    i = len(c4) - 1
+    if i < 201:
+        return None
+    price = p["closes"][i]
+    ema50 = p["ema50"][i]
+    ema200 = p["ema200"][i]
+    ema50_prev = p["ema50"][i-1]
+    if any(map(lambda x: x != x, [ema50, ema200, ema50_prev])):  # NaN check
+        return None
+    slope_up = ema50 > ema50_prev
+    slope_down = ema50 < ema50_prev
+
+    # "каша" фильтр: если EMA близко друг к другу (низкая направленность)
+    if abs(ema50 - ema200) / price < 0.001:
         return None
 
     if ema50 > ema200 and price > ema50 and slope_up:
@@ -144,95 +371,130 @@ def bias_4h(df4: pd.DataFrame):
         return "SHORT"
     return None
 
-def setup_1h(df1: pd.DataFrame, direction: str) -> bool:
-    df1 = with_indicators(df1)
-    last = df1.iloc[-1]
-    price = float(last["close"])
-    ema50 = float(last["ema50"])
-    r = float(last["rsi14"]) if not np.isnan(float(last["rsi14"])) else 50.0
-    a = float(last["atr14"]) if not np.isnan(float(last["atr14"])) else 0.0
+def vol_ok(atr_val: float, price: float, threshold: float) -> bool:
+    return (atr_val == atr_val) and atr_val > 0 and (atr_val / price) > threshold
 
-    # фильтр боковика/тишины: ATR должен быть не слишком маленький относительно цены
-    vol_ok = a > 0 and (a / price) > 0.0004
+def setup_1h(c1: List[Candle], direction: str, strict: bool) -> bool:
+    p = calc_pack(c1)
+    i = len(c1) - 1
+    price = p["closes"][i]
+    ema50 = p["ema50"][i]
+    r = p["rsi14"][i]
+    a = p["atr14"][i]
+    if any(map(lambda x: x != x, [ema50, r, a])):  # NaN
+        return False
 
-    if direction == "LONG":
-        return (price > ema50) and (50 <= r <= 70) and vol_ok
-    else:
-        return (price < ema50) and (30 <= r <= 50) and vol_ok
-
-def trigger_15m(df15: pd.DataFrame, direction: str) -> bool:
-    df15 = with_indicators(df15)
-    last = df15.iloc[-1]
-    prev = df15.iloc[-2]
-
-    price = float(last["close"])
-    ema50 = float(last["ema50"])
-    slope_up = float(last["ema50"]) > float(prev["ema50"])
-    slope_down = float(last["ema50"]) < float(prev["ema50"])
-
-    r = float(last["rsi14"]) if not np.isnan(float(last["rsi14"])) else 50.0
+    # строже/мягче
+    vol_thr = 0.00045 if strict else 0.00035
+    if not vol_ok(a, price, vol_thr):
+        return False
 
     if direction == "LONG":
-        return (price > ema50) and slope_up and (45 <= r <= 70)
+        r_ok = (52 <= r <= 70) if strict else (50 <= r <= 72)
+        return (price > ema50) and r_ok
     else:
-        return (price < ema50) and slope_down and (30 <= r <= 55)
+        r_ok = (30 <= r <= 48) if strict else (28 <= r <= 50)
+        return (price < ema50) and r_ok
 
-def confirm_5m(df5: pd.DataFrame, direction: str) -> bool:
-    df5 = with_indicators(df5)
-    last = df5.iloc[-1]
-    prev = df5.iloc[-2]
-
-    price = float(last["close"])
-    ema50 = float(last["ema50"])
-    slope_up = float(last["ema50"]) > float(prev["ema50"])
-    slope_down = float(last["ema50"]) < float(prev["ema50"])
-
-    r = float(last["rsi14"]) if not np.isnan(float(last["rsi14"])) else 50.0
+def trigger_15m(c15: List[Candle], direction: str, strict: bool) -> bool:
+    p = calc_pack(c15)
+    i = len(c15) - 1
+    price = p["closes"][i]
+    ema50 = p["ema50"][i]
+    ema50_prev = p["ema50"][i-1]
+    r = p["rsi14"][i]
+    if any(map(lambda x: x != x, [ema50, ema50_prev, r])):
+        return False
+    slope_up = ema50 > ema50_prev
+    slope_down = ema50 < ema50_prev
 
     if direction == "LONG":
-        return (price > ema50) and slope_up and (50 <= r <= 72)
+        r_ok = (45 <= r <= 68) if strict else (42 <= r <= 72)
+        return (price > ema50) and slope_up and r_ok
     else:
-        return (price < ema50) and slope_down and (28 <= r <= 50)
+        r_ok = (32 <= r <= 55) if strict else (28 <= r <= 58)
+        return (price < ema50) and slope_down and r_ok
 
-def build_signal(symbol: str, direction: str, df5: pd.DataFrame, df15: pd.DataFrame):
-    # Entry = последняя цена M5 (как "market now")
-    df5i = with_indicators(df5)
-    df15i = with_indicators(df15)
+def confirm_5m(c5: List[Candle], direction: str, strict: bool) -> bool:
+    p = calc_pack(c5)
+    i = len(c5) - 1
+    price = p["closes"][i]
+    ema50 = p["ema50"][i]
+    ema50_prev = p["ema50"][i-1]
+    r = p["rsi14"][i]
+    if any(map(lambda x: x != x, [ema50, ema50_prev, r])):
+        return False
+    slope_up = ema50 > ema50_prev
+    slope_down = ema50 < ema50_prev
 
-    entry = float(df5i.iloc[-1]["close"])
-    t = df5i.iloc[-1]["time"].to_pydatetime().replace(tzinfo=timezone.utc)
+    if direction == "LONG":
+        r_ok = (52 <= r <= 70) if strict else (50 <= r <= 72)
+        return (price > ema50) and slope_up and r_ok
+    else:
+        r_ok = (30 <= r <= 48) if strict else (28 <= r <= 50)
+        return (price < ema50) and slope_down and r_ok
 
-    # SL/TP по ATR(15m)
-    atr15 = float(df15i.iloc[-1]["atr14"])
-    if np.isnan(atr15) or atr15 <= 0:
+def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle], strict: bool) -> Optional[dict]:
+    # Entry
+    entry = c5[-1].c
+    created = utc_now().isoformat()
+
+    # ATR on 15m -> SL distance
+    p15 = calc_pack(c15)
+    atr15 = p15["atr14"][-1]
+    if atr15 != atr15 or atr15 <= 0:
         return None
 
-    sl_dist = atr15 * SL_ATR_MULT
+    rr = RR_STRICT if strict else RR_BALANCED
+    mult = SL_ATR_MULT_STRICT if strict else SL_ATR_MULT_BALANCED
+    sl_dist = atr15 * mult
+
+    # swing barrier check (не входить в стену)
+    swing_high = find_recent_swing_high(c15, lookback=80)
+    swing_low = find_recent_swing_low(c15, lookback=80)
 
     if direction == "LONG":
         sl = entry - sl_dist
-        tp = entry + sl_dist * RR
+        tp = entry + sl_dist * rr
+        if swing_high is not None:
+            # если ближайший "потолок" слишком близко к TP -> пропуск (строго)
+            if strict and swing_high < tp and (swing_high - entry) < (sl_dist * 0.9):
+                return None
     else:
         sl = entry + sl_dist
-        tp = entry - sl_dist * RR
+        tp = entry - sl_dist * rr
+        if swing_low is not None:
+            if strict and swing_low > tp and (entry - swing_low) < (sl_dist * 0.9):
+                return None
 
-    # Округление (EURUSD 5 знаков, XAUUSD 2)
+    # digits
     digits = 5 if "EUR" in symbol else 2
+    entry_r = round(entry, digits)
+    sl_r = round(sl, digits)
+    tp_r = round(tp, digits)
 
-    # Score 0..10: 4H(4) + 1H(2) + 15m(2) + 5m(2) = 10
-    score = 10.0  # сюда попадаем только если все фильтры прошли
+    # Score: максимум 10. STRICT даёт "честный" 10 только когда все фильтры прошли.
+    # BALANCED даёт 8.5 (чтобы отличалось в статистике).
+    score = 10.0 if strict else 8.5
+    mode = "STRICT" if strict else "BALANCED"
+
+    h = sha16(f"{symbol}|{direction}|{entry_r}|{sl_r}|{tp_r}|{mode}")
     return {
+        "created_utc": created,
         "symbol": symbol,
         "direction": direction,
-        "entry": round(entry, digits),
-        "sl": round(sl, digits),
-        "tp": round(tp, digits),
-        "score": round(score, 1),
-        "time": t,
+        "entry": entry_r,
+        "sl": sl_r,
+        "tp": tp_r,
+        "score": score,
+        "mode": mode,
+        "hash16": h,
     }
 
 def format_signal(sig: dict) -> str:
-    ts = sig["time"].strftime("%Y-%m-%d %H:%M UTC")
+    ts = datetime.fromisoformat(sig["created_utc"]).strftime("%Y-%m-%d %H:%M UTC")
+    rr = abs(sig["tp"] - sig["entry"]) / max(1e-12, abs(sig["entry"] - sig["sl"]))
+    sl_dist = abs(sig["entry"] - sig["sl"])
     return (
         f"📌 СИГНАЛ ({ts})\n"
         f"Инструмент: {sig['symbol']}\n"
@@ -240,33 +502,170 @@ def format_signal(sig: dict) -> str:
         f"Entry: {sig['entry']}\n"
         f"TP: {sig['tp']}\n"
         f"SL: {sig['sl']}\n"
-        f"Оценка (0–10): {sig['score']}\n\n"
-        f"Фильтры: 4H bias ✅  |  1H setup ✅  |  15m trigger ✅  |  5m confirm ✅\n"
-        f"⚠️ Это оценка по правилам, не гарантия."
+        f"Оценка (0–10): {sig['score']}  |  Режим: {sig['mode']}\n"
+        f"R:R ≈ {rr:.2f}  |  SL distance: {sl_dist:.5f}\n\n"
+        f"Управление сделкой (рекомендация):\n"
+        f"• На +1R → SL в безубыток\n"
+        f"• На +1.5R → закрыть 50%\n"
+        f"• Остаток трейлить по EMA20 (15m)\n\n"
+        f"Риск: 0.5–1% на сделку.\n"
+        f"⚠️ Это сигнал по правилам, не гарантия."
     )
 
 # =========================
-# Anti-spam state
+# Anti-spam: cooldown + anti-repeat
 # =========================
-last_sent_at = {}      # symbol -> datetime
-last_signal_hash = {}  # symbol -> hash str
-
-def make_hash(sig: dict) -> str:
-    raw = f"{sig['symbol']}|{sig['direction']}|{sig['entry']}|{sig['sl']}|{sig['tp']}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
 def cooldown_ok(symbol: str) -> bool:
-    now = datetime.now(timezone.utc)
-    prev = last_sent_at.get(symbol)
-    if not prev:
+    last = db_last_signal(symbol)
+    if not last:
         return True
-    return (now - prev) >= timedelta(minutes=COOLDOWN_MINUTES)
+    try:
+        t = datetime.fromisoformat(last["created_utc"])
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (utc_now() - t) >= timedelta(minutes=COOLDOWN_MINUTES)
+    except Exception:
+        return True
+
+def repeated(symbol: str, hash16: str) -> bool:
+    last = db_last_signal(symbol)
+    return bool(last and last["hash16"] == hash16)
+
+# =========================
+# Analysis pipeline
+# =========================
+async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, strict: bool) -> Optional[dict]:
+    # Global filters
+    now = utc_now()
+    if not in_session_window(now):
+        return None
+    if in_blackout(now):
+        return None
+    if not cooldown_ok(symbol):
+        return None
+
+    c4 = await fetch_td(session, symbol, TF_4H, N_4H)
+    direction = bias_4h(c4)
+    if direction is None:
+        return None
+
+    c1 = await fetch_td(session, symbol, TF_1H, N_1H)
+    if not setup_1h(c1, direction, strict):
+        return None
+
+    c15 = await fetch_td(session, symbol, TF_15, N_15)
+    if not trigger_15m(c15, direction, strict):
+        return None
+
+    c5 = await fetch_td(session, symbol, TF_5, N_5)
+    if not confirm_5m(c5, direction, strict):
+        return None
+
+    sig = build_signal(symbol, direction, c5, c15, strict)
+    if not sig:
+        return None
+
+    if repeated(symbol, sig["hash16"]):
+        return None
+
+    return sig
+
+async def run_analysis(send_only_signals: bool) -> str:
+    # Decide mode based on how many signals today
+    today_count = db_count_today()
+    need_more = today_count < MIN_SIGNALS_PER_DAY
+    strict = not need_more  # если не добрали, включаем BALANCED
+
+    threshold = STRICT_THRESHOLD if strict else BALANCED_THRESHOLD
+
+    # Авто режим: если strict и сегодня 0 — всё равно можно дать balanced позже, когда увидим что мало.
+    # Тут threshold как "флажок", но у нас скоринг фиксированный; оставим как будущий параметр.
+    _ = threshold
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            best = None
+            for sym in INSTRUMENTS:
+                sig = await analyze_symbol(session, sym, strict=strict)
+                if sig:
+                    if best is None or sig["score"] > best["score"]:
+                        best = sig
+
+            if not best:
+                if send_only_signals:
+                    return ""
+                mode = "STRICT" if strict else "BALANCED"
+                return f"🔎 Анализ выполнен ({utc_now().strftime('%Y-%m-%d %H:%M UTC')})\nСильных сетапов нет. Режим: {mode}. Сегодня сигналов: {today_count}/{MIN_SIGNALS_PER_DAY}"
+
+            db_add_signal(best)
+            return format_signal(best)
+
+    except Exception as e:
+        if send_only_signals:
+            return ""
+        return f"⚠️ Ошибка анализа: {e}"
+
+# =========================
+# Monitor TP/SL for OPEN signals
+# =========================
+def candle_hits(sig: dict, candles: List[Candle]) -> Optional[str]:
+    """
+    Возвращает 'TP' / 'SL' / None.
+    Если в одной свече могло задеть и TP и SL (редко), ставим UNKNOWN.
+    """
+    tp = float(sig["tp"])
+    sl = float(sig["sl"])
+    direction = sig["direction"]
+
+    # проверяем от момента сигнала
+    created = datetime.fromisoformat(sig["created_utc"])
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+
+    relevant = [c for c in candles if c.t >= created]
+    if not relevant:
+        return None
+
+    for c in relevant:
+        if direction == "LONG":
+            hit_tp = c.h >= tp
+            hit_sl = c.l <= sl
+        else:
+            hit_tp = c.l <= tp
+            hit_sl = c.h >= sl
+
+        if hit_tp and hit_sl:
+            return "UNKNOWN"
+        if hit_tp:
+            return "TP"
+        if hit_sl:
+            return "SL"
+    return None
+
+async def monitor_open_signals():
+    opens = db_open_signals()
+    if not opens:
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for sig in opens:
+                sym = sig["symbol"]
+                candles = await fetch_td(session, sym, TF_MONITOR, N_MONITOR)
+                res = candle_hits(sig, candles)
+                if res:
+                    db_mark_closed(sig["id"], res, utc_now().isoformat())
+    except Exception:
+        # не спамим
+        pass
 
 # =========================
 # Telegram
 # =========================
 kb_main = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="📊 Сигнал", callback_data="force_signal")],
+    [InlineKeyboardButton(text="📈 Сегодня", callback_data="today"),
+     InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
 ])
 
 bot = Bot(token=BOT_TOKEN)
@@ -279,8 +678,10 @@ async def start(m: Message):
         return
     await m.answer(
         "✅ Бот запущен.\n"
-        "Авто-анализ каждый час (4H/1H/15m/5m) по EUR/USD и XAU/USD.\n"
-        "Нажми «📊 Сигнал», чтобы сделать анализ прямо сейчас.",
+        "Фильтр: 4H → 1H → 15m → 5m по EUR/USD и XAU/USD.\n"
+        f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
+        f"Цель: минимум {MIN_SIGNALS_PER_DAY} сигнал(а) в день (авто BALANCED при нехватке).\n"
+        "Нажми «📊 Сигнал», чтобы сделать анализ сейчас.",
         reply_markup=kb_main
     )
 
@@ -293,67 +694,56 @@ async def force_signal(cb: CallbackQuery):
     text = await run_analysis(send_only_signals=False)
     await cb.message.answer(text, reply_markup=kb_main)
 
-async def analyze_symbol(session: aiohttp.ClientSession, symbol: str):
-    # 1) 4H bias
-    df4 = await fetch_td_candles(session, symbol, TF_4H, CANDLES_4H)
-    direction = bias_4h(df4)
-    if direction is None:
-        return None
+@dp.callback_query(F.data == "today")
+async def today(cb: CallbackQuery):
+    if not is_owner(cb.from_user.id):
+        await cb.answer("⛔️", show_alert=True)
+        return
+    c = db_count_today()
+    await cb.answer()
+    await cb.message.answer(f"📈 Сегодня сигналов: {c}/{MIN_SIGNALS_PER_DAY}", reply_markup=kb_main)
 
-    # 2) 1H setup
-    df1 = await fetch_td_candles(session, symbol, TF_1H, CANDLES_1H)
-    if not setup_1h(df1, direction):
-        return None
+@dp.callback_query(F.data == "stats")
+async def stats(cb: CallbackQuery):
+    if not is_owner(cb.from_user.id):
+        await cb.answer("⛔️", show_alert=True)
+        return
+    s = db_stats(days=7)
+    await cb.answer()
+    await cb.message.answer(
+        "📊 Статистика за 7 дней:\n"
+        f"Всего: {s['TOTAL']}\n"
+        f"Закрыто: {s['CLOSED']} | TP: {s['TP']} | SL: {s['SL']} | UNKNOWN: {s['UNKNOWN']}\n"
+        f"Winrate (по закрытым): {s['WINRATE']:.1f}%",
+        reply_markup=kb_main
+    )
 
-    # 3) 15m trigger
-    df15 = await fetch_td_candles(session, symbol, TF_15, CANDLES_15)
-    if not trigger_15m(df15, direction):
-        return None
+@dp.message(F.text == "/last")
+async def last(m: Message):
+    if not is_owner(m.from_user.id):
+        await m.answer(deny_text())
+        return
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+      SELECT created_utc, symbol, direction, entry, sl, tp, score, mode, status
+      FROM signals ORDER BY id DESC LIMIT 1
+    """)
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        await m.answer("Пока сигналов нет.", reply_markup=kb_main)
+        return
+    created, sym, d, e, sl, tp, sc, mode, st = r
+    await m.answer(
+        f"Последний сигнал:\n{created}\n{sym} {d}\nEntry {e} | SL {sl} | TP {tp}\nScore {sc} | Mode {mode} | Status {st}",
+        reply_markup=kb_main
+    )
 
-    # 4) 5m confirm
-    df5 = await fetch_td_candles(session, symbol, TF_5, CANDLES_5)
-    if not confirm_5m(df5, direction):
-        return None
-
-    sig = build_signal(symbol, direction, df5, df15)
-    if not sig:
-        return None
-    return sig
-
-async def run_analysis(send_only_signals: bool = True) -> str:
-    try:
-        async with aiohttp.ClientSession() as session:
-            best = None
-            for sym in INSTRUMENTS:
-                sig = await analyze_symbol(session, sym)
-                if sig and sig["score"] >= SCORE_THRESHOLD:
-                    if best is None or sig["score"] > best["score"]:
-                        best = sig
-
-            if not best:
-                if send_only_signals:
-                    return ""  # молчим в авто-режиме
-                return f"🔎 Анализ выполнен ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})\nСильных сетапов нет (порог {SCORE_THRESHOLD}/10)."
-
-            # анти-повтор + кулдаун
-            h = make_hash(best)
-            sym = best["symbol"]
-            if (not cooldown_ok(sym)) and send_only_signals:
-                return ""
-            if last_signal_hash.get(sym) == h and send_only_signals:
-                return ""
-
-            last_signal_hash[sym] = h
-            last_sent_at[sym] = datetime.now(timezone.utc)
-            return format_signal(best)
-
-    except Exception as e:
-        if send_only_signals:
-            # в авто-режиме можно не спамить ошибками
-            return ""
-        return f"⚠️ Ошибка анализа: {e}"
-
-async def scheduled_job():
+# =========================
+# Jobs
+# =========================
+async def scheduled_analysis():
     text = await run_analysis(send_only_signals=True)
     if text:
         await bot.send_message(chat_id=OWNER_ID, text=text, reply_markup=kb_main)
@@ -361,9 +751,11 @@ async def scheduled_job():
 async def main():
     if not BOT_TOKEN or OWNER_ID == 0 or not TD_API_KEY:
         raise RuntimeError("Set BOT_TOKEN, OWNER_ID, TD_API_KEY env vars.")
+    db_init()
 
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(scheduled_job, "interval", minutes=AUTO_INTERVAL_MINUTES, id="hourly", replace_existing=True)
+    scheduler.add_job(scheduled_analysis, "interval", minutes=AUTO_INTERVAL_MINUTES, id="analysis", replace_existing=True)
+    scheduler.add_job(monitor_open_signals, "interval", minutes=MONITOR_INTERVAL_MINUTES, id="monitor", replace_existing=True)
     scheduler.start()
 
     await dp.start_polling(bot)
