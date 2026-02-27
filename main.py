@@ -5,51 +5,50 @@ import sqlite3
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# =========================
+# ==========================================================
 # ENV
-# =========================
+# ==========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 TD_API_KEY = os.getenv("TD_API_KEY", "")
 
+# Частота авто-анализа (минуты) — для breakout логики лучше 15
 AUTO_INTERVAL_MINUTES = int(os.getenv("AUTO_INTERVAL_MINUTES", "15"))
+
+# Мониторинг открытых сигналов (для статистики) — каждые 5 минут ок
 MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "5"))
+
+# Heartbeat: чтобы бот не "молчал", отправляет статус раз в N минут
+HEARTBEAT_INTERVAL_MINUTES = int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "180"))  # 3 часа
+
+# Цель по сигналам
 MIN_SIGNALS_PER_DAY = int(os.getenv("MIN_SIGNALS_PER_DAY", "3"))
 
-# RR and SL multipliers
-RR_STRICT = float(os.getenv("RR_STRICT", "2.1"))
-RR_BALANCED = float(os.getenv("RR_BALANCED", "1.85"))
-RR_FLOW = float(os.getenv("RR_FLOW", "1.6"))
-
-SL_ATR_MULT_STRICT = float(os.getenv("SL_ATR_MULT_STRICT", "1.9"))
-SL_ATR_MULT_BALANCED = float(os.getenv("SL_ATR_MULT_BALANCED", "1.65"))
-SL_ATR_MULT_FLOW = float(os.getenv("SL_ATR_MULT_FLOW", "1.5"))
-
-# Cooldowns (minutes)
-COOLDOWN_STRICT = int(os.getenv("COOLDOWN_STRICT", "150"))
-COOLDOWN_BALANCED = int(os.getenv("COOLDOWN_BALANCED", "120"))
-COOLDOWN_FLOW = int(os.getenv("COOLDOWN_FLOW", "90"))
-
-# Sessions (UTC)
+# Сессия (UTC)
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
 
+# Черный список времени (новости) в UTC, формат:
+# 2026-02-27T12:25:00Z/2026-02-27T13:05:00Z,2026-02-28T...
 NEWS_BLACKOUT_UTC = os.getenv("NEWS_BLACKOUT_UTC", "").strip()
 
+# Инструменты — строго
 INSTRUMENTS = ["EUR/USD", "XAU/USD"]
 
+# Таймфреймы
 TF_4H = "4h"
 TF_1H = "1h"
 TF_15 = "15min"
 TF_5 = "5min"
 TF_MONITOR = "5min"
 
+# Количество свечей (запас)
 N_4H = 350
 N_1H = 650
 N_15 = 900
@@ -58,19 +57,58 @@ N_MONITOR = 450
 
 DB_PATH = "bot.db"
 
+# ==========================================================
+# Режимы — бот сам понижает строгость, чтобы добирать сигналы
+# ==========================================================
+MODES = ["FLOW", "BALANCED", "STRICT"]  # от мягкого к строгому
 
-# =========================
+MODE_PARAMS: Dict[str, dict] = {
+    "STRICT": {
+        "score": 9.5,
+        "rr": 2.10,
+        "sl_atr_mult": 1.90,
+        "cooldown_min": 150,
+        "breakout_n": 8,     # пробой диапазона 8 свечей 15m
+        "impulse_k": 1.10,   # range 5m >= ATR5*1.10
+        "vol_thr_1h": 0.00050,
+        "rsi_long_min": 56,
+        "rsi_short_max": 44,
+    },
+    "BALANCED": {
+        "score": 8.5,
+        "rr": 1.85,
+        "sl_atr_mult": 1.65,
+        "cooldown_min": 120,
+        "breakout_n": 5,
+        "impulse_k": 0.90,
+        "vol_thr_1h": 0.00038,
+        "rsi_long_min": 52,
+        "rsi_short_max": 50,
+    },
+    "FLOW": {
+        "score": 7.8,
+        "rr": 1.60,
+        "sl_atr_mult": 1.50,
+        "cooldown_min": 75,   # ниже — чтобы добирать до 3/день
+        "breakout_n": 3,
+        "impulse_k": 0.65,
+        "vol_thr_1h": 0.00030,
+        "rsi_long_min": 49,
+        "rsi_short_max": 53,
+    },
+}
+
+# ==========================================================
 # Helpers
-# =========================
+# ==========================================================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 def in_session_window(now_utc: datetime) -> bool:
-    h = now_utc.hour
-    return SESSION_START_UTC <= h < SESSION_END_UTC
+    return SESSION_START_UTC <= now_utc.hour < SESSION_END_UTC
 
 def parse_blackouts(s: str) -> List[Tuple[datetime, datetime]]:
-    out = []
+    out: List[Tuple[datetime, datetime]] = []
     if not s:
         return out
     parts = [p.strip() for p in s.split(",") if p.strip()]
@@ -99,16 +137,19 @@ def sha16(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 def price_sanity_ok(symbol: str, price: float) -> bool:
+    # широкие диапазоны
     if symbol == "EUR/USD":
         return 0.8 <= price <= 1.6
     if symbol == "XAU/USD":
         return 1000 <= price <= 10000
     return True
 
+def digits_for(symbol: str) -> int:
+    return 5 if "EUR" in symbol else 2
 
-# =========================
+# ==========================================================
 # DB
-# =========================
+# ==========================================================
 def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -128,8 +169,29 @@ def db_init():
       hash16 TEXT NOT NULL
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS meta (
+      k TEXT PRIMARY KEY,
+      v TEXT
+    )
+    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_utc)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+    con.commit()
+    con.close()
+
+def meta_get(key: str) -> Optional[str]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT v FROM meta WHERE k=?", (key,))
+    r = cur.fetchone()
+    con.close()
+    return r[0] if r else None
+
+def meta_set(key: str, val: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, val))
     con.commit()
     con.close()
 
@@ -210,10 +272,9 @@ def db_stats(days: int = 7) -> dict:
     out["WINRATE"] = (out["TP"] / closed * 100.0) if closed > 0 else 0.0
     return out
 
-
-# =========================
+# ==========================================================
 # Market data (TwelveData)
-# =========================
+# ==========================================================
 @dataclass
 class Candle:
     t: datetime
@@ -239,17 +300,16 @@ async def fetch_td(session: aiohttp.ClientSession, symbol: str, interval: str, o
     if not values:
         raise RuntimeError(f"No candles for {symbol} {interval}")
     candles: List[Candle] = []
-    for v in reversed(values):
+    for v in reversed(values):  # oldest -> newest
         t = datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc)
         candles.append(Candle(
             t=t, o=float(v["open"]), h=float(v["high"]), l=float(v["low"]), c=float(v["close"])
         ))
     return candles
 
-
-# =========================
-# Indicators
-# =========================
+# ==========================================================
+# Indicators (pure python)
+# ==========================================================
 def ema_list(closes: List[float], period: int) -> List[float]:
     out = [float("nan")] * len(closes)
     if len(closes) < period:
@@ -321,22 +381,27 @@ def calc_pack(candles: List[Candle]) -> dict:
         "atr14": atr_list(candles, 14),
     }
 
-
-# =========================
+# ==========================================================
 # Strategy
-# =========================
+# ==========================================================
 def bias_4h(c4: List[Candle]) -> Optional[str]:
-    p = calc_pack(c4)
+    """
+    Тренд по 4H: EMA50 vs EMA200 + наклон EMA50 + цена относительно EMA50.
+    """
     if len(c4) < 220:
         return None
+    p = calc_pack(c4)
     price = p["closes"][-1]
     ema50 = p["ema50"][-1]
     ema200 = p["ema200"][-1]
     ema50_prev = p["ema50"][-2]
     if any(x != x for x in [ema50, ema200, ema50_prev]):
         return None
+
+    # слабый тренд / сжатие
     if abs(ema50 - ema200) / max(1e-12, price) < 0.001:
         return None
+
     if ema50 > ema200 and price > ema50 and ema50 > ema50_prev:
         return "LONG"
     if ema50 < ema200 and price < ema50 and ema50 < ema50_prev:
@@ -347,7 +412,9 @@ def vol_ok(atr_val: float, price: float, threshold: float) -> bool:
     return (atr_val == atr_val) and atr_val > 0 and (atr_val / max(1e-12, price)) > threshold
 
 def setup_1h(c1: List[Candle], direction: str, mode: str) -> bool:
-    # mode: STRICT / BALANCED / FLOW
+    """
+    1H фильтр: цена относительно EMA50, RSI, минимум волатильности по ATR.
+    """
     p = calc_pack(c1)
     price = p["closes"][-1]
     ema50 = p["ema50"][-1]
@@ -356,23 +423,21 @@ def setup_1h(c1: List[Candle], direction: str, mode: str) -> bool:
     if any(x != x for x in [ema50, r, a]):
         return False
 
-    # чем мягче режим - тем меньше порог волатильности
-    vol_thr = 0.00050 if mode == "STRICT" else (0.00038 if mode == "BALANCED" else 0.00030)
-    if not vol_ok(a, price, vol_thr):
+    prm = MODE_PARAMS[mode]
+    if not vol_ok(a, price, prm["vol_thr_1h"]):
         return False
 
     if direction == "LONG":
-        r_min = 56 if mode == "STRICT" else (52 if mode == "BALANCED" else 49)
-        r_max = 70 if mode == "STRICT" else 72
-        return (price > ema50) and (r_min <= r <= r_max)
+        return (price > ema50) and (r >= prm["rsi_long_min"]) and (r <= 72)
     else:
-        r_max = 44 if mode == "STRICT" else (50 if mode == "BALANCED" else 53)
-        r_min = 30 if mode != "FLOW" else 28
-        return (price < ema50) and (r_min <= r <= r_max)
+        return (price < ema50) and (r >= 28) and (r <= prm["rsi_short_max"])
 
 def breakout_15m(c15: List[Candle], direction: str, mode: str) -> bool:
-    # STRICT: 8 свечей, BALANCED: 5, FLOW: 3
-    n = 8 if mode == "STRICT" else (5 if mode == "BALANCED" else 3)
+    """
+    Триггер: пробой диапазона последних N 15m свечей (без текущей).
+    """
+    prm = MODE_PARAMS[mode]
+    n = prm["breakout_n"]
     if len(c15) < n + 2:
         return False
     prev = c15[-(n+1):-1]
@@ -382,6 +447,9 @@ def breakout_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     return (last.c > prev_high) if direction == "LONG" else (last.c < prev_low)
 
 def ema_confirm_5m(c5: List[Candle], direction: str) -> bool:
+    """
+    5m базовое подтверждение: цена над EMA50 (или под) + наклон EMA50.
+    """
     p = calc_pack(c5)
     price = p["closes"][-1]
     ema50 = p["ema50"][-1]
@@ -393,18 +461,18 @@ def ema_confirm_5m(c5: List[Candle], direction: str) -> bool:
     return (price > ema50 and slope_up) if direction == "LONG" else (price < ema50 and slope_down)
 
 def impulse_5m(c5: List[Candle], direction: str, mode: str) -> bool:
+    """
+    5m импульс: направленная свеча + range >= ATR5*k
+    """
+    prm = MODE_PARAMS[mode]
     p = calc_pack(c5)
     atr5 = p["atr14"][-1]
     if atr5 != atr5 or atr5 <= 0:
         return False
     last = c5[-1]
     rng = last.h - last.l
-
-    # STRICT: 1.1 ATR, BALANCED: 0.9 ATR, FLOW: 0.65 ATR
-    k = 1.10 if mode == "STRICT" else (0.90 if mode == "BALANCED" else 0.65)
-
     dir_ok = (last.c > last.o) if direction == "LONG" else (last.c < last.o)
-    return dir_ok and (rng >= atr5 * k)
+    return dir_ok and (rng >= atr5 * prm["impulse_k"])
 
 def swing_high(candles: List[Candle], lookback: int = 90) -> Optional[float]:
     if len(candles) < lookback:
@@ -417,25 +485,23 @@ def swing_low(candles: List[Candle], lookback: int = 90) -> Optional[float]:
     return min(c.l for c in candles[-lookback:])
 
 def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle], mode: str) -> Optional[dict]:
+    prm = MODE_PARAMS[mode]
     entry = c5[-1].c
     if not price_sanity_ok(symbol, entry):
         return None
 
     created = utc_now().isoformat()
+
+    # ATR(15m) для SL/TP
     p15 = calc_pack(c15)
     atr15 = p15["atr14"][-1]
     if atr15 != atr15 or atr15 <= 0:
         return None
 
-    if mode == "STRICT":
-        rr, mult, score, cooldown = RR_STRICT, SL_ATR_MULT_STRICT, 9.5, COOLDOWN_STRICT
-    elif mode == "BALANCED":
-        rr, mult, score, cooldown = RR_BALANCED, SL_ATR_MULT_BALANCED, 8.5, COOLDOWN_BALANCED
-    else:
-        rr, mult, score, cooldown = RR_FLOW, SL_ATR_MULT_FLOW, 7.8, COOLDOWN_FLOW
+    sl_dist = atr15 * prm["sl_atr_mult"]
+    rr = prm["rr"]
 
-    sl_dist = atr15 * mult
-
+    # Не входить в "стену" (свинг уровни)
     sh = swing_high(c15, 90)
     slw = swing_low(c15, 90)
 
@@ -443,21 +509,22 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
         sl = entry - sl_dist
         tp = entry + sl_dist * rr
         if sh is not None and sh < tp:
-            near = (sh - entry) < (sl_dist * (0.85 if mode != "FLOW" else 0.55))
-            if near:
+            # если ближайший high слишком близко — пропускаем
+            near_mult = 0.85 if mode != "FLOW" else 0.55
+            if (sh - entry) < (sl_dist * near_mult):
                 return None
     else:
         sl = entry + sl_dist
         tp = entry - sl_dist * rr
         if slw is not None and slw > tp:
-            near = (entry - slw) < (sl_dist * (0.85 if mode != "FLOW" else 0.55))
-            if near:
+            near_mult = 0.85 if mode != "FLOW" else 0.55
+            if (entry - slw) < (sl_dist * near_mult):
                 return None
 
-    digits = 5 if "EUR" in symbol else 2
-    entry_r = round(entry, digits)
-    sl_r = round(sl, digits)
-    tp_r = round(tp, digits)
+    d = digits_for(symbol)
+    entry_r = round(entry, d)
+    sl_r = round(sl, d)
+    tp_r = round(tp, d)
 
     h = sha16(f"{symbol}|{direction}|{entry_r}|{sl_r}|{tp_r}|{mode}")
 
@@ -468,10 +535,10 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
         "entry": entry_r,
         "sl": sl_r,
         "tp": tp_r,
-        "score": score,
+        "score": prm["score"],
         "mode": mode,
         "hash16": h,
-        "cooldown": cooldown,
+        "cooldown_min": prm["cooldown_min"],
     }
 
 def format_signal(sig: dict) -> str:
@@ -495,6 +562,10 @@ def format_signal(sig: dict) -> str:
         f"⚠️ Это сигнал по правилам, не гарантия."
     )
 
+def repeated(symbol: str, hash16: str) -> bool:
+    last = db_last_signal(symbol)
+    return bool(last and last["hash16"] == hash16)
+
 def cooldown_ok(symbol: str, cooldown_minutes: int) -> bool:
     last = db_last_signal(symbol)
     if not last:
@@ -507,13 +578,32 @@ def cooldown_ok(symbol: str, cooldown_minutes: int) -> bool:
     except Exception:
         return True
 
-def repeated(symbol: str, hash16: str) -> bool:
-    last = db_last_signal(symbol)
-    return bool(last and last["hash16"] == hash16)
+# ==========================================================
+# Mode selection (чтобы добирать до MIN_SIGNALS_PER_DAY)
+# ==========================================================
+def choose_mode() -> str:
+    """
+    Логика:
+      - Если уже добрали MIN_SIGNALS_PER_DAY -> STRICT
+      - Если 0 сигналов -> FLOW (макс добор)
+      - Если 1 сигнал -> BALANCED
+      - Если 2 сигнала -> BALANCED
+    """
+    c = db_count_today()
+    if c >= MIN_SIGNALS_PER_DAY:
+        return "STRICT"
+    if c == 0:
+        return "FLOW"
+    return "BALANCED"
 
+# ==========================================================
+# Analysis
+# ==========================================================
 async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Optional[dict]:
     now = utc_now()
-    if not in_session_window(now) or in_blackout(now):
+    if not in_session_window(now):
+        return None
+    if in_blackout(now):
         return None
 
     # 4H bias
@@ -532,7 +622,7 @@ async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str)
     if not breakout_15m(c15, direction, mode):
         return None
 
-    # 5m confirms
+    # 5m confirm
     c5 = await fetch_td(session, symbol, TF_5, N_5)
     if not ema_confirm_5m(c5, direction):
         return None
@@ -542,23 +632,14 @@ async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str)
     sig = build_signal(symbol, direction, c5, c15, mode)
     if not sig:
         return None
-    if not cooldown_ok(symbol, sig["cooldown"]):
-        return None
+
     if repeated(symbol, sig["hash16"]):
         return None
-    return sig
 
-def choose_mode() -> str:
-    # если сегодня сигналов мало — опускаем строгость
-    c = db_count_today()
-    if c >= MIN_SIGNALS_PER_DAY:
-        return "STRICT"
-    # добор
-    if c == 0:
-        return "FLOW"
-    if c == 1:
-        return "BALANCED"
-    return "BALANCED"
+    if not cooldown_ok(symbol, sig["cooldown_min"]):
+        return None
+
+    return sig
 
 async def run_analysis(send_only_signals: bool) -> str:
     mode = choose_mode()
@@ -586,7 +667,10 @@ async def run_analysis(send_only_signals: bool) -> str:
             return ""
         return f"⚠️ Ошибка анализа: {e}"
 
-def candle_hits(sig: dict, candles: List['Candle']) -> Optional[str]:
+# ==========================================================
+# Monitor TP/SL for OPEN signals
+# ==========================================================
+def candle_hits(sig: dict, candles: List[Candle]) -> Optional[str]:
     tp = float(sig["tp"])
     sl = float(sig["sl"])
     direction = sig["direction"]
@@ -597,12 +681,14 @@ def candle_hits(sig: dict, candles: List['Candle']) -> Optional[str]:
     for c in candles:
         if c.t < created:
             continue
+
         if direction == "LONG":
             hit_tp = c.h >= tp
             hit_sl = c.l <= sl
         else:
             hit_tp = c.l <= tp
             hit_sl = c.h >= sl
+
         if hit_tp and hit_sl:
             return "UNKNOWN"
         if hit_tp:
@@ -625,10 +711,13 @@ async def monitor_open_signals():
     except Exception:
         pass
 
-# =========================
+# ==========================================================
 # Telegram
-# =========================
+# ==========================================================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+
+def owner_guard(user_id: int) -> bool:
+    return user_id == OWNER_ID
 
 def kb_main():
     kb = InlineKeyboardMarkup()
@@ -639,9 +728,6 @@ def kb_main():
     )
     return kb
 
-def owner_guard(user_id: int) -> bool:
-    return user_id == OWNER_ID
-
 @bot.message_handler(commands=["start"])
 def on_start(msg):
     if not owner_guard(msg.from_user.id):
@@ -650,11 +736,13 @@ def on_start(msg):
     bot.send_message(
         msg.chat.id,
         "✅ Бот запущен.\n"
-        "Фильтр: 4H → 1H → 15m(BREAKOUT) → 5m(EMA+IMPULSE)\n"
-        f"Инструменты: EUR/USD и XAU/USD\n"
+        "Логика: 4H (trend) → 1H (setup) → 15m (breakout) → 5m (EMA+impulse)\n"
+        "Инструменты: EUR/USD и XAU/USD\n"
         f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
-        f"Авто-анализ каждые {AUTO_INTERVAL_MINUTES} минут.\n"
-        f"Цель: минимум {MIN_SIGNALS_PER_DAY}/день (режимы STRICT/BALANCED/FLOW).\n",
+        f"Авто-анализ: каждые {AUTO_INTERVAL_MINUTES} минут\n"
+        f"Статус-отчёт: каждые {HEARTBEAT_INTERVAL_MINUTES} минут\n"
+        f"Цель: минимум {MIN_SIGNALS_PER_DAY} сигнал(а) в день\n"
+        "Нажми «📊 Сигнал», чтобы сделать анализ сейчас.",
         reply_markup=kb_main()
     )
 
@@ -663,14 +751,17 @@ def on_callback(call):
     if not owner_guard(call.from_user.id):
         bot.answer_callback_query(call.id, "⛔️", show_alert=True)
         return
+
     if call.data == "force_signal":
         bot.answer_callback_query(call.id, "Анализирую...")
         text = asyncio.run(run_analysis(send_only_signals=False))
         bot.send_message(call.message.chat.id, text, reply_markup=kb_main())
+
     elif call.data == "today":
         bot.answer_callback_query(call.id)
         c = db_count_today()
         bot.send_message(call.message.chat.id, f"📈 Сегодня сигналов: {c}/{MIN_SIGNALS_PER_DAY}", reply_markup=kb_main())
+
     elif call.data == "stats":
         bot.answer_callback_query(call.id)
         s = db_stats(days=7)
@@ -683,8 +774,11 @@ def on_callback(call):
             reply_markup=kb_main()
         )
 
-# Scheduler wrappers
+# ==========================================================
+# Jobs
+# ==========================================================
 def job_analysis():
+    # Авто-анализ: чтобы не спамить — отправляем только сигнал (если найден)
     try:
         text = asyncio.run(run_analysis(send_only_signals=True))
         if text:
@@ -698,14 +792,51 @@ def job_monitor():
     except Exception:
         pass
 
+def job_heartbeat():
+    # Статус раз в N часов, чтобы было видно, что бот живой
+    try:
+        last = meta_get("heartbeat_last")
+        now = utc_now()
+
+        # если уже отправляли недавно — не спамим (защита)
+        if last:
+            try:
+                t = datetime.fromisoformat(last)
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                if (now - t) < timedelta(minutes=max(10, HEARTBEAT_INTERVAL_MINUTES - 1)):
+                    return
+            except Exception:
+                pass
+
+        mode = choose_mode()
+        c = db_count_today()
+        msg = (
+            f"🟢 Статус: бот активен\n"
+            f"UTC: {now.strftime('%Y-%m-%d %H:%M')}\n"
+            f"Режим: {mode}\n"
+            f"Сегодня сигналов: {c}/{MIN_SIGNALS_PER_DAY}\n"
+            f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
+            f"Auto interval: {AUTO_INTERVAL_MINUTES} min"
+        )
+        bot.send_message(OWNER_ID, msg, reply_markup=kb_main())
+        meta_set("heartbeat_last", now.isoformat())
+    except Exception:
+        pass
+
+# ==========================================================
+# Main
+# ==========================================================
 def main():
     if not BOT_TOKEN or OWNER_ID == 0 or not TD_API_KEY:
         raise RuntimeError("Set BOT_TOKEN, OWNER_ID, TD_API_KEY env vars.")
+
     db_init()
 
     sched = BackgroundScheduler(timezone="UTC")
     sched.add_job(job_analysis, "interval", minutes=AUTO_INTERVAL_MINUTES, id="analysis", replace_existing=True)
     sched.add_job(job_monitor, "interval", minutes=MONITOR_INTERVAL_MINUTES, id="monitor", replace_existing=True)
+    sched.add_job(job_heartbeat, "interval", minutes=HEARTBEAT_INTERVAL_MINUTES, id="heartbeat", replace_existing=True)
     sched.start()
 
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
