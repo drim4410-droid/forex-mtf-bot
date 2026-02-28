@@ -11,9 +11,6 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# =========================
-# ENV
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 TD_API_KEY = os.getenv("TD_API_KEY", "")
@@ -44,57 +41,27 @@ N_MONITOR = 450
 
 DB_PATH = "bot.db"
 
-# =========================
-# MODES
-# =========================
 MODE_PARAMS: Dict[str, dict] = {
     "STRICT": {
-        "score_base": 9.3,
-        "rr": 2.10,
-        "sl_atr_mult": 1.90,
-        "cooldown_min": 150,
-        "breakout_n": 8,
-        "impulse_k": 1.05,
-        "vol_thr_1h": 0.00050,
-        "rsi_long_min": 56,
-        "rsi_short_max": 44,
-        "pullback_dist_atr": 0.45,
-        "cont_dist_atr": 0.35,
-        "range_n": 10,
+        "score_base": 9.3, "rr": 2.10, "sl_atr_mult": 1.90,
+        "cooldown_min": 150, "breakout_n": 8, "impulse_k": 1.05,
+        "vol_thr_1h": 0.00050, "rsi_long_min": 56, "rsi_short_max": 44,
+        "pullback_dist_atr": 0.45, "cont_dist_atr": 0.35, "range_n": 10,
     },
     "BALANCED": {
-        "score_base": 8.3,
-        "rr": 1.85,
-        "sl_atr_mult": 1.65,
-        "cooldown_min": 120,
-        "breakout_n": 5,
-        "impulse_k": 0.85,
-        "vol_thr_1h": 0.00038,
-        "rsi_long_min": 52,
-        "rsi_short_max": 50,
-        "pullback_dist_atr": 0.60,
-        "cont_dist_atr": 0.55,
-        "range_n": 8,
+        "score_base": 8.3, "rr": 1.85, "sl_atr_mult": 1.65,
+        "cooldown_min": 120, "breakout_n": 5, "impulse_k": 0.85,
+        "vol_thr_1h": 0.00038, "rsi_long_min": 52, "rsi_short_max": 50,
+        "pullback_dist_atr": 0.60, "cont_dist_atr": 0.55, "range_n": 8,
     },
     "FLOW": {
-        "score_base": 7.6,
-        "rr": 1.60,
-        "sl_atr_mult": 1.45,
-        "cooldown_min": 55,        # было 70 -> чаще сигналы
-        "breakout_n": 2,
-        "impulse_k": 0.45,
-        "vol_thr_1h": 0.00018,
-        "rsi_long_min": 46,
-        "rsi_short_max": 56,
-        "pullback_dist_atr": 1.20,
-        "cont_dist_atr": 1.10,     # continuation чаще (EUR)
-        "range_n": 6,              # range-break чаще
+        "score_base": 7.6, "rr": 1.60, "sl_atr_mult": 1.45,
+        "cooldown_min": 55, "breakout_n": 2, "impulse_k": 0.45,
+        "vol_thr_1h": 0.00018, "rsi_long_min": 46, "rsi_short_max": 56,
+        "pullback_dist_atr": 1.20, "cont_dist_atr": 1.10, "range_n": 6,
     },
 }
 
-# =========================
-# Helpers
-# =========================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -171,21 +138,6 @@ def db_init():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_utc)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
-    con.commit()
-    con.close()
-
-def meta_get(key: str) -> Optional[str]:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT v FROM meta WHERE k=?", (key,))
-    r = cur.fetchone()
-    con.close()
-    return r[0] if r else None
-
-def meta_set(key: str, val: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, val))
     con.commit()
     con.close()
 
@@ -296,9 +248,7 @@ async def fetch_td(session: aiohttp.ClientSession, symbol: str, interval: str, o
     candles: List[Candle] = []
     for v in reversed(values):
         t = datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc)
-        candles.append(Candle(
-            t=t, o=float(v["open"]), h=float(v["high"]), l=float(v["low"]), c=float(v["close"])
-        ))
+        candles.append(Candle(t=t, o=float(v["open"]), h=float(v["high"]), l=float(v["low"]), c=float(v["close"])))
     return candles
 
 # =========================
@@ -377,7 +327,7 @@ def calc_pack(candles: List[Candle]) -> dict:
     }
 
 # =========================
-# Strategy blocks
+# Strategy
 # =========================
 def bias_4h(c4: List[Candle]) -> Optional[str]:
     if len(c4) < 220:
@@ -472,7 +422,6 @@ def breakout_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     prev_high = max(c.h for c in prev)
     prev_low = min(c.l for c in prev)
     rng = max(1e-12, last.h - last.l)
-
     if direction == "LONG":
         return (last.c > prev_high) or (last.h > prev_high and last.c >= (last.h - 0.25 * rng))
     else:
@@ -514,7 +463,6 @@ def continuation_15m(c15: List[Candle], direction: str, mode: str) -> bool:
         return False
     if atr <= 0:
         return False
-
     last = c15[-1]
     dist = prm["cont_dist_atr"] * atr
 
@@ -528,10 +476,6 @@ def continuation_15m(c15: List[Candle], direction: str, mode: str) -> bool:
         return touched and closed_down
 
 def range_break_15m(c15: List[Candle], direction: str, mode: str) -> bool:
-    """
-    RANGE BREAK: для EUR когда он "в середине"
-    - пробой close выше max(close) за N свечей (без текущей) или ниже min(close)
-    """
     prm = MODE_PARAMS[mode]
     n = prm["range_n"]
     if len(c15) < n + 2:
@@ -562,7 +506,6 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
         return None
 
     created = utc_now().isoformat()
-
     p15 = calc_pack(c15)
     atr15 = p15["atr14"][-1]
     if atr15 != atr15 or atr15 <= 0:
@@ -666,9 +609,6 @@ def choose_mode() -> str:
         return "FLOW"
     return "BALANCED"
 
-# =========================
-# ANALYSIS + DIAG
-# =========================
 async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Tuple[Optional[dict], List[str]]:
     reasons: List[str] = []
     now = utc_now()
@@ -703,106 +643,101 @@ async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str)
 
     candidates: List[dict] = []
 
-    # BREAKOUT
     if breakout_15m(c15, direction, mode):
         if impulse_5m(c5, direction, mode):
             sig = build_signal(symbol, direction, c5, c15, mode, "BREAKOUT")
-            if sig:
-                candidates.append(sig); reasons.append("✅ BREAKOUT: ok")
-            else:
-                reasons.append("❌ BREAKOUT: SL/TP blocked")
+            if sig: candidates.append(sig); reasons.append("✅ BREAKOUT: ok")
+            else: reasons.append("❌ BREAKOUT: SL/TP blocked")
         else:
             reasons.append("❌ BREAKOUT: нет импульса 5m")
     else:
         reasons.append("❌ BREAKOUT: нет пробоя диапазона 15m")
 
-    # PULLBACK
     if pullback_15m(c15, direction, mode):
         last5 = c5[-1]
         dir_candle = (last5.c > last5.o) if direction == "LONG" else (last5.c < last5.o)
         if dir_candle:
             sig = build_signal(symbol, direction, c5, c15, mode, "PULLBACK")
-            if sig:
-                candidates.append(sig); reasons.append("✅ PULLBACK: ok")
-            else:
-                reasons.append("❌ PULLBACK: SL/TP blocked")
+            if sig: candidates.append(sig); reasons.append("✅ PULLBACK: ok")
+            else: reasons.append("❌ PULLBACK: SL/TP blocked")
         else:
             reasons.append("❌ PULLBACK: 5m свеча не в сторону тренда")
     else:
         reasons.append("❌ PULLBACK: цена не у EMA/нет разворота 15m")
 
-    # CONTINUATION
     if continuation_15m(c15, direction, mode):
         sig = build_signal(symbol, direction, c5, c15, mode, "CONTINUATION")
-        if sig:
-            candidates.append(sig); reasons.append("✅ CONTINUATION: ok")
-        else:
-            reasons.append("❌ CONTINUATION: SL/TP blocked")
+        if sig: candidates.append(sig); reasons.append("✅ CONTINUATION: ok")
+        else: reasons.append("❌ CONTINUATION: SL/TP blocked")
     else:
         reasons.append("❌ CONTINUATION: нет касания EMA20/нет возврата")
 
-    # RANGE_BREAK (новый, особенно полезен для EUR)
     if range_break_15m(c15, direction, mode):
-        # не требуем импульс, но EMA confirm 5m уже есть
         sig = build_signal(symbol, direction, c5, c15, mode, "RANGE_BREAK")
-        if sig:
-            candidates.append(sig); reasons.append("✅ RANGE_BREAK: ok")
-        else:
-            reasons.append("❌ RANGE_BREAK: SL/TP blocked")
+        if sig: candidates.append(sig); reasons.append("✅ RANGE_BREAK: ok")
+        else: reasons.append("❌ RANGE_BREAK: SL/TP blocked")
     else:
         reasons.append("❌ RANGE_BREAK: нет пробоя close-диапазона")
 
     if not candidates:
         return None, reasons
-
     best = max(candidates, key=lambda x: x["score"])
     return best, reasons
+
+# ✅ ключ: возвращаем signal или причину блокировки
+async def get_final_signal_for_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Tuple[Optional[dict], str]:
+    sig, _ = await analyze_symbol(session, symbol, mode)
+    if not sig:
+        return None, "no_candidate"
+
+    rep = repeated(symbol, sig["hash16"])
+    cd = sig["cooldown_min"]
+    if mode == "FLOW" and symbol == "XAU/USD":
+        cd = min(cd, 40)
+
+    if rep:
+        return None, "repeat"
+    if not cooldown_ok(symbol, cd):
+        return None, f"cooldown({cd}m)"
+
+    return sig, "ok"
 
 async def run_analysis(send_only_signals: bool) -> str:
     mode = choose_mode()
     try:
         async with aiohttp.ClientSession() as session:
+            # авто-анализ: берём лучший из двух (как раньше)
             best = None
-            best_reasons: Dict[str, str] = {}
-
             for sym in INSTRUMENTS:
-                sig, reasons = await analyze_symbol(session, sym, mode)
-                if sig:
-                    if best is None or sig["score"] > best["score"]:
-                        best = sig
-                        best_reasons = {"symbol": sym, "setup": sig["setup"]}
+                sig, status = await get_final_signal_for_symbol(session, sym, mode)
+                if sig and (best is None or sig["score"] > best["score"]):
+                    best = sig
 
             if not best:
-                if send_only_signals:
-                    return ""
-                return (
+                return "" if send_only_signals else (
                     f"🔎 Анализ выполнен ({utc_now().strftime('%Y-%m-%d %H:%M UTC')})\n"
-                    f"Сильных сетапов нет. Режим: {mode}. Сегодня: {db_count_today()}/{MIN_SIGNALS_PER_DAY}"
+                    f"Сильных сетапов нет или блокировки. Режим: {mode}."
                 )
-
-            # ✅ финальные блокировки (раньше они были "невидимыми")
-            if repeated(best["symbol"], best["hash16"]):
-                if send_only_signals:
-                    return ""
-                return f"⚠️ Кандидат есть, но блок: повтор сигнала (hash). {best_reasons}"
-
-            # адаптивный cooldown: для XAU в FLOW ещё мягче
-            cd = best["cooldown_min"]
-            if mode == "FLOW" and best["symbol"] == "XAU/USD":
-                cd = min(cd, 40)
-
-            if not cooldown_ok(best["symbol"], cd):
-                if send_only_signals:
-                    return ""
-                return f"⚠️ Кандидат есть, но блок: cooldown {cd}m. {best_reasons}"
 
             db_add_signal(best)
             return format_signal(best)
 
     except Exception as e:
-        if send_only_signals:
-            return ""
-        return f"⚠️ Ошибка анализа: {e}"
+        return "" if send_only_signals else f"⚠️ Ошибка анализа: {e}"
+
+# ✅ НОВОЕ: для кнопки/now отправляем ВСЕ сигналы по каждому инструменту
+async def run_force_all() -> List[str]:
+    mode = choose_mode()
+    out: List[str] = []
+    async with aiohttp.ClientSession() as session:
+        for sym in INSTRUMENTS:
+            sig, status = await get_final_signal_for_symbol(session, sym, mode)
+            if sig:
+                db_add_signal(sig)
+                out.append(format_signal(sig))
+            else:
+                out.append(f"ℹ️ {sym}: кандидата нет или блок ({status}).")
+    return out
 
 async def run_diag() -> str:
     mode = choose_mode()
@@ -812,9 +747,8 @@ async def run_diag() -> str:
             for sym in INSTRUMENTS:
                 sig, reasons = await analyze_symbol(session, sym, mode)
                 out.append(f"\n— {sym} —")
-                out.extend(reasons[:22])
+                out.extend(reasons[:24])
                 if sig:
-                    # покажем блокировки прямо в DIAG
                     rep = repeated(sym, sig["hash16"])
                     cd = sig["cooldown_min"]
                     if mode == "FLOW" and sym == "XAU/USD":
@@ -894,14 +828,8 @@ def on_start(msg):
     bot.send_message(
         msg.chat.id,
         "✅ Бот запущен.\n"
-        "Фильтр: 4H(trend) → 1H(setup) → 15m(trigger) → 5m(confirm)\n"
-        "Сетапы: BREAKOUT + PULLBACK + CONTINUATION + RANGE_BREAK\n"
-        f"Инструменты: EUR/USD и XAU/USD\n"
-        f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
-        f"Авто-анализ: каждые {AUTO_INTERVAL_MINUTES} минут\n"
-        f"Статус-отчёт: каждые {HEARTBEAT_INTERVAL_MINUTES} минут\n"
-        f"Цель: минимум {MIN_SIGNALS_PER_DAY}/день\n"
-        "Команды: /diag (почему нет сигналов)\n",
+        "Кнопка «Сигнал» отправляет сигналы по каждому инструменту отдельно.\n"
+        "Команды: /diag, /now\n",
         reply_markup=kb_main()
     )
 
@@ -916,6 +844,16 @@ def on_diag(msg):
     for i in range(0, len(text), chunk):
         bot.send_message(msg.chat.id, text[i:i+chunk])
 
+@bot.message_handler(commands=["now"])
+def on_now(msg):
+    if not owner_guard(msg.from_user.id):
+        bot.reply_to(msg, "⛔️")
+        return
+    bot.send_message(msg.chat.id, "Ищу сигналы сейчас...")
+    res = asyncio.run(run_force_all())
+    for t in res:
+        bot.send_message(msg.chat.id, t, reply_markup=kb_main())
+
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
     if not owner_guard(call.from_user.id):
@@ -924,8 +862,9 @@ def on_callback(call):
 
     if call.data == "force_signal":
         bot.answer_callback_query(call.id, "Анализирую...")
-        text = asyncio.run(run_analysis(send_only_signals=False))
-        bot.send_message(call.message.chat.id, text, reply_markup=kb_main())
+        res = asyncio.run(run_force_all())
+        for t in res:
+            bot.send_message(call.message.chat.id, t, reply_markup=kb_main())
 
     elif call.data == "today":
         bot.answer_callback_query(call.id)
@@ -963,18 +902,7 @@ def job_monitor():
 
 def job_heartbeat():
     try:
-        last = meta_get("heartbeat_last")
         now = utc_now()
-        if last:
-            try:
-                t = datetime.fromisoformat(last)
-                if t.tzinfo is None:
-                    t = t.replace(tzinfo=timezone.utc)
-                if (now - t) < timedelta(minutes=max(10, HEARTBEAT_INTERVAL_MINUTES - 1)):
-                    return
-            except Exception:
-                pass
-
         mode = choose_mode()
         c = db_count_today()
         msg = (
@@ -982,17 +910,12 @@ def job_heartbeat():
             f"UTC: {now.strftime('%Y-%m-%d %H:%M')}\n"
             f"Режим: {mode}\n"
             f"Сегодня сигналов: {c}/{MIN_SIGNALS_PER_DAY}\n"
-            f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
             f"Auto interval: {AUTO_INTERVAL_MINUTES} min"
         )
         bot.send_message(OWNER_ID, msg, reply_markup=kb_main())
-        meta_set("heartbeat_last", now.isoformat())
     except Exception:
         pass
 
-# =========================
-# Main
-# =========================
 def main():
     if not BOT_TOKEN or OWNER_ID == 0 or not TD_API_KEY:
         raise RuntimeError("Set BOT_TOKEN, OWNER_ID, TD_API_KEY env vars.")
