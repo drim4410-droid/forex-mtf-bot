@@ -20,6 +20,7 @@ MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "5"))
 HEARTBEAT_INTERVAL_MINUTES = int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "180"))
 MIN_SIGNALS_PER_DAY = int(os.getenv("MIN_SIGNALS_PER_DAY", "3"))
 
+# ✅ авто-анализ можно оставить в сессию, а /now и кнопка будут работать всегда
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
 
@@ -136,8 +137,6 @@ def db_init():
       v TEXT
     )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_utc)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
     con.commit()
     con.close()
 
@@ -231,13 +230,7 @@ class Candle:
 
 async def fetch_td(session: aiohttp.ClientSession, symbol: str, interval: str, outputsize: int) -> List[Candle]:
     url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": str(outputsize),
-        "apikey": TD_API_KEY,
-        "format": "JSON",
-    }
+    params = {"symbol": symbol, "interval": interval, "outputsize": str(outputsize), "apikey": TD_API_KEY, "format": "JSON"}
     async with session.get(url, params=params, timeout=30) as r:
         data = await r.json()
     if isinstance(data, dict) and data.get("status") == "error":
@@ -339,19 +332,16 @@ def bias_4h(c4: List[Candle]) -> Optional[str]:
     ema50_prev = p["ema50"][-2]
     if any(x != x for x in [ema50, ema200, ema50_prev]):
         return None
-
     if abs(ema50 - ema200) / max(1e-12, price) < 0.00045:
         if price > ema200 and ema50 >= ema50_prev:
             return "LONG"
         if price < ema200 and ema50 <= ema50_prev:
             return "SHORT"
         return None
-
     if ema50 > ema200 and price > ema50 and ema50 > ema50_prev:
         return "LONG"
     if ema50 < ema200 and price < ema50 and ema50 < ema50_prev:
         return "SHORT"
-
     if price > ema200 and ema50 >= ema50_prev:
         return "LONG"
     if price < ema200 and ema50 <= ema50_prev:
@@ -371,20 +361,17 @@ def setup_1h(symbol: str, c1: List[Candle], direction: str, mode: str) -> bool:
     atr = p["atr14"][-1]
     if any(x != x for x in [ema20, ema50, rsi, atr]):
         return False
-
     thr = prm["vol_thr_1h"]
     if symbol == "XAU/USD":
         thr *= 0.55
     if not vol_ok(atr, price, thr):
         return False
-
     if mode == "FLOW" and symbol == "XAU/USD":
         ema_ok_long = price > ema20
         ema_ok_short = price < ema20
     else:
         ema_ok_long = price > ema50
         ema_ok_short = price < ema50
-
     if direction == "LONG":
         return ema_ok_long and rsi >= prm["rsi_long_min"] and rsi <= (78 if symbol == "XAU/USD" else 74)
     else:
@@ -434,21 +421,16 @@ def pullback_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     ema20 = p["ema20"][-1]
     ema50 = p["ema50"][-1]
     atr = p["atr14"][-1]
-    if any(x != x for x in [ema20, ema50, atr]):
+    if any(x != x for x in [ema20, ema50, atr]) or atr <= 0:
         return False
-    if atr <= 0:
-        return False
-
     dist = prm["pullback_dist_atr"] * atr
     near_ema20 = abs(price - ema20) <= dist
     near_ema50 = abs(price - ema50) <= dist
-
     last = c15[-1]
     body = abs(last.c - last.o)
     rng = max(1e-12, (last.h - last.l))
     thr = 0.25 if mode == "FLOW" else 0.35
     body_ok = (body / rng) >= thr
-
     if direction == "LONG":
         return (near_ema20 or near_ema50) and (last.c > last.o) and body_ok
     else:
@@ -459,13 +441,10 @@ def continuation_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     p = calc_pack(c15)
     ema20 = p["ema20"][-1]
     atr = p["atr14"][-1]
-    if any(x != x for x in [ema20, atr]):
-        return False
-    if atr <= 0:
+    if any(x != x for x in [ema20, atr]) or atr <= 0:
         return False
     last = c15[-1]
     dist = prm["cont_dist_atr"] * atr
-
     if direction == "LONG":
         touched = last.l <= (ema20 + dist)
         closed_up = (last.c > last.o) and (last.c >= ema20 - 0.15 * atr)
@@ -484,33 +463,24 @@ def range_break_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     last = c15[-1]
     prev_max_close = max(c.c for c in prev)
     prev_min_close = min(c.c for c in prev)
-    if direction == "LONG":
-        return last.c > prev_max_close
-    else:
-        return last.c < prev_min_close
+    return (last.c > prev_max_close) if direction == "LONG" else (last.c < prev_min_close)
 
 def swing_high(candles: List[Candle], lookback: int = 90) -> Optional[float]:
-    if len(candles) < lookback:
-        return None
-    return max(c.h for c in candles[-lookback:])
+    return max(c.h for c in candles[-lookback:]) if len(candles) >= lookback else None
 
 def swing_low(candles: List[Candle], lookback: int = 90) -> Optional[float]:
-    if len(candles) < lookback:
-        return None
-    return min(c.l for c in candles[-lookback:])
+    return min(c.l for c in candles[-lookback:]) if len(candles) >= lookback else None
 
 def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle], mode: str, setup: str) -> Optional[dict]:
     prm = MODE_PARAMS[mode]
     entry = c5[-1].c
     if not price_sanity_ok(symbol, entry):
         return None
-
     created = utc_now().isoformat()
     p15 = calc_pack(c15)
     atr15 = p15["atr14"][-1]
     if atr15 != atr15 or atr15 <= 0:
         return None
-
     rr = prm["rr"]
     sl_dist = atr15 * prm["sl_atr_mult"]
 
@@ -538,28 +508,13 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
     tp_r = round(tp, d)
 
     base = prm["score_base"]
-    if setup == "BREAKOUT":
-        score = base + 0.45
-    elif setup == "CONTINUATION":
-        score = base + 0.25
-    elif setup == "RANGE_BREAK":
-        score = base + 0.20
-    else:
-        score = base + 0.15
-
+    score = base + (0.45 if setup == "BREAKOUT" else 0.25 if setup == "CONTINUATION" else 0.20 if setup == "RANGE_BREAK" else 0.15)
     h = sha16(f"{symbol}|{direction}|{entry_r}|{sl_r}|{tp_r}|{mode}|{setup}")
 
     return {
-        "created_utc": created,
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry_r,
-        "sl": sl_r,
-        "tp": tp_r,
-        "score": round(score, 1),
-        "mode": mode,
-        "setup": setup,
-        "hash16": h,
+        "created_utc": created, "symbol": symbol, "direction": direction,
+        "entry": entry_r, "sl": sl_r, "tp": tp_r,
+        "score": round(score, 1), "mode": mode, "setup": setup, "hash16": h,
         "cooldown_min": prm["cooldown_min"],
     }
 
@@ -609,14 +564,15 @@ def choose_mode() -> str:
         return "FLOW"
     return "BALANCED"
 
-async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Tuple[Optional[dict], List[str]]:
+# ✅ force=True отключает фильтр сессии/blackout
+async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str, force: bool=False) -> Tuple[Optional[dict], List[str]]:
     reasons: List[str] = []
     now = utc_now()
 
-    if not in_session_window(now):
+    if (not force) and (not in_session_window(now)):
         reasons.append("⛔️ вне сессии")
         return None, reasons
-    if in_blackout(now):
+    if (not force) and in_blackout(now):
         reasons.append("⛔️ blackout (новости)")
         return None, reasons
 
@@ -684,11 +640,10 @@ async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str)
     best = max(candidates, key=lambda x: x["score"])
     return best, reasons
 
-# ✅ ключ: возвращаем signal или причину блокировки
-async def get_final_signal_for_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Tuple[Optional[dict], str]:
-    sig, _ = await analyze_symbol(session, symbol, mode)
+async def get_final_signal_for_symbol(session: aiohttp.ClientSession, symbol: str, mode: str, force: bool=False) -> Tuple[Optional[dict], str, List[str]]:
+    sig, reasons = await analyze_symbol(session, symbol, mode, force=force)
     if not sig:
-        return None, "no_candidate"
+        return None, "no_candidate", reasons
 
     rep = repeated(symbol, sig["hash16"])
     cd = sig["cooldown_min"]
@@ -696,48 +651,43 @@ async def get_final_signal_for_symbol(session: aiohttp.ClientSession, symbol: st
         cd = min(cd, 40)
 
     if rep:
-        return None, "repeat"
+        return None, "repeat", reasons
     if not cooldown_ok(symbol, cd):
-        return None, f"cooldown({cd}m)"
+        return None, f"cooldown({cd}m)", reasons
 
-    return sig, "ok"
+    return sig, "ok", reasons
 
-async def run_analysis(send_only_signals: bool) -> str:
-    mode = choose_mode()
-    try:
-        async with aiohttp.ClientSession() as session:
-            # авто-анализ: берём лучший из двух (как раньше)
-            best = None
-            for sym in INSTRUMENTS:
-                sig, status = await get_final_signal_for_symbol(session, sym, mode)
-                if sig and (best is None or sig["score"] > best["score"]):
-                    best = sig
-
-            if not best:
-                return "" if send_only_signals else (
-                    f"🔎 Анализ выполнен ({utc_now().strftime('%Y-%m-%d %H:%M UTC')})\n"
-                    f"Сильных сетапов нет или блокировки. Режим: {mode}."
-                )
-
-            db_add_signal(best)
-            return format_signal(best)
-
-    except Exception as e:
-        return "" if send_only_signals else f"⚠️ Ошибка анализа: {e}"
-
-# ✅ НОВОЕ: для кнопки/now отправляем ВСЕ сигналы по каждому инструменту
 async def run_force_all() -> List[str]:
     mode = choose_mode()
     out: List[str] = []
     async with aiohttp.ClientSession() as session:
         for sym in INSTRUMENTS:
-            sig, status = await get_final_signal_for_symbol(session, sym, mode)
+            sig, status, reasons = await get_final_signal_for_symbol(session, sym, mode, force=True)  # ✅ force=True
             if sig:
                 db_add_signal(sig)
                 out.append(format_signal(sig))
             else:
-                out.append(f"ℹ️ {sym}: кандидата нет или блок ({status}).")
+                # ✅ покажем реальную причину (если это была сессия — ты сразу увидишь)
+                short = " | ".join(reasons[:3]) if reasons else ""
+                out.append(f"ℹ️ {sym}: кандидата нет или блок ({status}). {short}")
     return out
+
+async def run_analysis_auto() -> str:
+    """Авто-анализ: соблюдает сессию/blackout"""
+    mode = choose_mode()
+    try:
+        async with aiohttp.ClientSession() as session:
+            best = None
+            for sym in INSTRUMENTS:
+                sig, status, _ = await get_final_signal_for_symbol(session, sym, mode, force=False)
+                if sig and (best is None or sig["score"] > best["score"]):
+                    best = sig
+            if not best:
+                return ""
+            db_add_signal(best)
+            return format_signal(best)
+    except Exception:
+        return ""
 
 async def run_diag() -> str:
     mode = choose_mode()
@@ -745,7 +695,7 @@ async def run_diag() -> str:
     try:
         async with aiohttp.ClientSession() as session:
             for sym in INSTRUMENTS:
-                sig, reasons = await analyze_symbol(session, sym, mode)
+                sig, reasons = await analyze_symbol(session, sym, mode, force=False)
                 out.append(f"\n— {sym} —")
                 out.extend(reasons[:24])
                 if sig:
@@ -761,32 +711,23 @@ async def run_diag() -> str:
     return "\n".join(out)
 
 # =========================
-# Monitor TP/SL
+# Monitor TP/SL (не трогаем)
 # =========================
-def candle_hits(sig: dict, candles: List["Candle"]) -> Optional[str]:
-    tp = float(sig["tp"])
-    sl = float(sig["sl"])
-    direction = sig["direction"]
+def candle_hits(sig: dict, candles: List[Candle]) -> Optional[str]:
+    tp = float(sig["tp"]); sl = float(sig["sl"]); direction = sig["direction"]
     created = datetime.fromisoformat(sig["created_utc"])
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-
     for c in candles:
         if c.t < created:
             continue
         if direction == "LONG":
-            hit_tp = c.h >= tp
-            hit_sl = c.l <= sl
+            hit_tp = c.h >= tp; hit_sl = c.l <= sl
         else:
-            hit_tp = c.l <= tp
-            hit_sl = c.h >= sl
-
-        if hit_tp and hit_sl:
-            return "UNKNOWN"
-        if hit_tp:
-            return "TP"
-        if hit_sl:
-            return "SL"
+            hit_tp = c.l <= tp; hit_sl = c.h >= sl
+        if hit_tp and hit_sl: return "UNKNOWN"
+        if hit_tp: return "TP"
+        if hit_sl: return "SL"
     return None
 
 async def monitor_open_signals():
@@ -823,13 +764,14 @@ def kb_main():
 @bot.message_handler(commands=["start"])
 def on_start(msg):
     if not owner_guard(msg.from_user.id):
-        bot.reply_to(msg, "⛔️ Доступ запрещён. Этот бот доступен только владельцу.")
+        bot.reply_to(msg, "⛔️ Доступ запрещён.")
         return
     bot.send_message(
         msg.chat.id,
         "✅ Бот запущен.\n"
-        "Кнопка «Сигнал» отправляет сигналы по каждому инструменту отдельно.\n"
-        "Команды: /diag, /now\n",
+        "Важно: /now и кнопка «Сигнал» работают 24/5 (игнорируют сессию).\n"
+        "Авто-анализ — по расписанию и по твоей сессии UTC.\n"
+        "Команды: /diag /now\n",
         reply_markup=kb_main()
     )
 
@@ -859,18 +801,15 @@ def on_callback(call):
     if not owner_guard(call.from_user.id):
         bot.answer_callback_query(call.id, "⛔️", show_alert=True)
         return
-
     if call.data == "force_signal":
         bot.answer_callback_query(call.id, "Анализирую...")
         res = asyncio.run(run_force_all())
         for t in res:
             bot.send_message(call.message.chat.id, t, reply_markup=kb_main())
-
     elif call.data == "today":
         bot.answer_callback_query(call.id)
         c = db_count_today()
         bot.send_message(call.message.chat.id, f"📈 Сегодня сигналов: {c}/{MIN_SIGNALS_PER_DAY}", reply_markup=kb_main())
-
     elif call.data == "stats":
         bot.answer_callback_query(call.id)
         s = db_stats(days=7)
@@ -888,7 +827,7 @@ def on_callback(call):
 # =========================
 def job_analysis():
     try:
-        text = asyncio.run(run_analysis(send_only_signals=True))
+        text = asyncio.run(run_analysis_auto())
         if text:
             bot.send_message(OWNER_ID, text, reply_markup=kb_main())
     except Exception:
