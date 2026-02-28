@@ -59,7 +59,8 @@ MODE_PARAMS: Dict[str, dict] = {
         "rsi_long_min": 56,
         "rsi_short_max": 44,
         "pullback_dist_atr": 0.45,
-        "cont_dist_atr": 0.35,   # continuation: насколько глубоко допускаем к EMA20
+        "cont_dist_atr": 0.35,
+        "range_n": 10,
     },
     "BALANCED": {
         "score_base": 8.3,
@@ -73,19 +74,21 @@ MODE_PARAMS: Dict[str, dict] = {
         "rsi_short_max": 50,
         "pullback_dist_atr": 0.60,
         "cont_dist_atr": 0.55,
+        "range_n": 8,
     },
     "FLOW": {
         "score_base": 7.6,
         "rr": 1.60,
         "sl_atr_mult": 1.45,
-        "cooldown_min": 70,
+        "cooldown_min": 55,        # было 70 -> чаще сигналы
         "breakout_n": 2,
         "impulse_k": 0.45,
         "vol_thr_1h": 0.00018,
         "rsi_long_min": 46,
         "rsi_short_max": 56,
         "pullback_dist_atr": 1.20,
-        "cont_dist_atr": 0.85,
+        "cont_dist_atr": 1.10,     # continuation чаще (EUR)
+        "range_n": 6,              # range-break чаще
     },
 }
 
@@ -264,7 +267,7 @@ def db_stats(days: int = 7) -> dict:
     return out
 
 # =========================
-# Market data (TwelveData)
+# Market data
 # =========================
 @dataclass
 class Candle:
@@ -374,7 +377,7 @@ def calc_pack(candles: List[Candle]) -> dict:
     }
 
 # =========================
-# Strategy
+# Strategy blocks
 # =========================
 def bias_4h(c4: List[Candle]) -> Optional[str]:
     if len(c4) < 220:
@@ -403,7 +406,6 @@ def bias_4h(c4: List[Candle]) -> Optional[str]:
         return "LONG"
     if price < ema200 and ema50 <= ema50_prev:
         return "SHORT"
-
     return None
 
 def vol_ok(atr_val: float, price: float, thr: float) -> bool:
@@ -423,7 +425,6 @@ def setup_1h(symbol: str, c1: List[Candle], direction: str, mode: str) -> bool:
     thr = prm["vol_thr_1h"]
     if symbol == "XAU/USD":
         thr *= 0.55
-
     if not vol_ok(atr, price, thr):
         return False
 
@@ -462,12 +463,6 @@ def impulse_5m(c5: List[Candle], direction: str, mode: str) -> bool:
     return dir_ok and (rng >= atr5 * prm["impulse_k"])
 
 def breakout_15m(c15: List[Candle], direction: str, mode: str) -> bool:
-    """
-    Мягкий breakout:
-    - LONG: close выше max(high) за N свечей
-    - либо high пробил max(high) и close >= (high - 0.25*range)
-      (чтобы не пропускать ложные мелкие пробои)
-    """
     prm = MODE_PARAMS[mode]
     n = prm["breakout_n"]
     if len(c15) < n + 2:
@@ -476,8 +471,8 @@ def breakout_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     last = c15[-1]
     prev_high = max(c.h for c in prev)
     prev_low = min(c.l for c in prev)
-
     rng = max(1e-12, last.h - last.l)
+
     if direction == "LONG":
         return (last.c > prev_high) or (last.h > prev_high and last.c >= (last.h - 0.25 * rng))
     else:
@@ -502,23 +497,15 @@ def pullback_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     last = c15[-1]
     body = abs(last.c - last.o)
     rng = max(1e-12, (last.h - last.l))
-
     thr = 0.25 if mode == "FLOW" else 0.35
     body_ok = (body / rng) >= thr
 
     if direction == "LONG":
-        candle_ok = last.c > last.o
-        return (near_ema20 or near_ema50) and candle_ok and body_ok
+        return (near_ema20 or near_ema50) and (last.c > last.o) and body_ok
     else:
-        candle_ok = last.c < last.o
-        return (near_ema20 or near_ema50) and candle_ok and body_ok
+        return (near_ema20 or near_ema50) and (last.c < last.o) and body_ok
 
 def continuation_15m(c15: List[Candle], direction: str, mode: str) -> bool:
-    """
-    Новая логика CONTINUATION:
-    - в тренде цена "касается/прокалывает" EMA20
-    - и закрывается обратно в сторону тренда
-    """
     prm = MODE_PARAMS[mode]
     p = calc_pack(c15)
     ema20 = p["ema20"][-1]
@@ -532,13 +519,31 @@ def continuation_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     dist = prm["cont_dist_atr"] * atr
 
     if direction == "LONG":
-        touched = (last.l <= ema20 + dist)  # прокол вниз к EMA20
-        closed_up = last.c > last.o and last.c >= ema20  # закрытие обратно выше/у EMA20
+        touched = last.l <= (ema20 + dist)
+        closed_up = (last.c > last.o) and (last.c >= ema20 - 0.15 * atr)
         return touched and closed_up
     else:
-        touched = (last.h >= ema20 - dist)
-        closed_down = last.c < last.o and last.c <= ema20
+        touched = last.h >= (ema20 - dist)
+        closed_down = (last.c < last.o) and (last.c <= ema20 + 0.15 * atr)
         return touched and closed_down
+
+def range_break_15m(c15: List[Candle], direction: str, mode: str) -> bool:
+    """
+    RANGE BREAK: для EUR когда он "в середине"
+    - пробой close выше max(close) за N свечей (без текущей) или ниже min(close)
+    """
+    prm = MODE_PARAMS[mode]
+    n = prm["range_n"]
+    if len(c15) < n + 2:
+        return False
+    prev = c15[-(n+1):-1]
+    last = c15[-1]
+    prev_max_close = max(c.c for c in prev)
+    prev_min_close = min(c.c for c in prev)
+    if direction == "LONG":
+        return last.c > prev_max_close
+    else:
+        return last.c < prev_min_close
 
 def swing_high(candles: List[Candle], lookback: int = 90) -> Optional[float]:
     if len(candles) < lookback:
@@ -589,12 +594,13 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
     sl_r = round(sl, d)
     tp_r = round(tp, d)
 
-    # scoring: breakout>continuation>pullback
     base = prm["score_base"]
     if setup == "BREAKOUT":
         score = base + 0.45
     elif setup == "CONTINUATION":
         score = base + 0.25
+    elif setup == "RANGE_BREAK":
+        score = base + 0.20
     else:
         score = base + 0.15
 
@@ -663,7 +669,7 @@ def choose_mode() -> str:
 # =========================
 # ANALYSIS + DIAG
 # =========================
-async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str, diag: bool = False) -> Tuple[Optional[dict], List[str]]:
+async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str) -> Tuple[Optional[dict], List[str]]:
     reasons: List[str] = []
     now = utc_now()
 
@@ -697,61 +703,59 @@ async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str,
 
     candidates: List[dict] = []
 
-    # 1) BREAKOUT
+    # BREAKOUT
     if breakout_15m(c15, direction, mode):
         if impulse_5m(c5, direction, mode):
             sig = build_signal(symbol, direction, c5, c15, mode, "BREAKOUT")
             if sig:
-                candidates.append(sig)
-                reasons.append("✅ BREAKOUT: ok")
+                candidates.append(sig); reasons.append("✅ BREAKOUT: ok")
             else:
-                reasons.append("❌ BREAKOUT: SL/TP sanity/near-wall blocked")
+                reasons.append("❌ BREAKOUT: SL/TP blocked")
         else:
             reasons.append("❌ BREAKOUT: нет импульса 5m")
     else:
         reasons.append("❌ BREAKOUT: нет пробоя диапазона 15m")
 
-    # 2) PULLBACK
+    # PULLBACK
     if pullback_15m(c15, direction, mode):
         last5 = c5[-1]
         dir_candle = (last5.c > last5.o) if direction == "LONG" else (last5.c < last5.o)
         if dir_candle:
             sig = build_signal(symbol, direction, c5, c15, mode, "PULLBACK")
             if sig:
-                candidates.append(sig)
-                reasons.append("✅ PULLBACK: ok")
+                candidates.append(sig); reasons.append("✅ PULLBACK: ok")
             else:
-                reasons.append("❌ PULLBACK: SL/TP sanity/near-wall blocked")
+                reasons.append("❌ PULLBACK: SL/TP blocked")
         else:
             reasons.append("❌ PULLBACK: 5m свеча не в сторону тренда")
     else:
         reasons.append("❌ PULLBACK: цена не у EMA/нет разворота 15m")
 
-    # 3) CONTINUATION (новый)
+    # CONTINUATION
     if continuation_15m(c15, direction, mode):
-        # для continuation не требуем impulse, достаточно 5m EMA confirm уже есть
         sig = build_signal(symbol, direction, c5, c15, mode, "CONTINUATION")
         if sig:
-            candidates.append(sig)
-            reasons.append("✅ CONTINUATION: ok")
+            candidates.append(sig); reasons.append("✅ CONTINUATION: ok")
         else:
-            reasons.append("❌ CONTINUATION: SL/TP sanity/near-wall blocked")
+            reasons.append("❌ CONTINUATION: SL/TP blocked")
     else:
         reasons.append("❌ CONTINUATION: нет касания EMA20/нет возврата")
+
+    # RANGE_BREAK (новый, особенно полезен для EUR)
+    if range_break_15m(c15, direction, mode):
+        # не требуем импульс, но EMA confirm 5m уже есть
+        sig = build_signal(symbol, direction, c5, c15, mode, "RANGE_BREAK")
+        if sig:
+            candidates.append(sig); reasons.append("✅ RANGE_BREAK: ok")
+        else:
+            reasons.append("❌ RANGE_BREAK: SL/TP blocked")
+    else:
+        reasons.append("❌ RANGE_BREAK: нет пробоя close-диапазона")
 
     if not candidates:
         return None, reasons
 
     best = max(candidates, key=lambda x: x["score"])
-
-    if repeated(symbol, best["hash16"]):
-        reasons.append("❌ повтор сигнала (hash)")
-        return None, reasons
-
-    if not cooldown_ok(symbol, best["cooldown_min"]):
-        reasons.append(f"❌ cooldown {best['cooldown_min']}m")
-        return None, reasons
-
     return best, reasons
 
 async def run_analysis(send_only_signals: bool) -> str:
@@ -759,10 +763,14 @@ async def run_analysis(send_only_signals: bool) -> str:
     try:
         async with aiohttp.ClientSession() as session:
             best = None
+            best_reasons: Dict[str, str] = {}
+
             for sym in INSTRUMENTS:
-                sig, _ = await analyze_symbol(session, sym, mode, diag=False)
+                sig, reasons = await analyze_symbol(session, sym, mode)
                 if sig:
-                    best = sig if best is None or sig["score"] > best["score"] else best
+                    if best is None or sig["score"] > best["score"]:
+                        best = sig
+                        best_reasons = {"symbol": sym, "setup": sig["setup"]}
 
             if not best:
                 if send_only_signals:
@@ -771,6 +779,22 @@ async def run_analysis(send_only_signals: bool) -> str:
                     f"🔎 Анализ выполнен ({utc_now().strftime('%Y-%m-%d %H:%M UTC')})\n"
                     f"Сильных сетапов нет. Режим: {mode}. Сегодня: {db_count_today()}/{MIN_SIGNALS_PER_DAY}"
                 )
+
+            # ✅ финальные блокировки (раньше они были "невидимыми")
+            if repeated(best["symbol"], best["hash16"]):
+                if send_only_signals:
+                    return ""
+                return f"⚠️ Кандидат есть, но блок: повтор сигнала (hash). {best_reasons}"
+
+            # адаптивный cooldown: для XAU в FLOW ещё мягче
+            cd = best["cooldown_min"]
+            if mode == "FLOW" and best["symbol"] == "XAU/USD":
+                cd = min(cd, 40)
+
+            if not cooldown_ok(best["symbol"], cd):
+                if send_only_signals:
+                    return ""
+                return f"⚠️ Кандидат есть, но блок: cooldown {cd}m. {best_reasons}"
 
             db_add_signal(best)
             return format_signal(best)
@@ -786,11 +810,18 @@ async def run_diag() -> str:
     try:
         async with aiohttp.ClientSession() as session:
             for sym in INSTRUMENTS:
-                sig, reasons = await analyze_symbol(session, sym, mode, diag=True)
+                sig, reasons = await analyze_symbol(session, sym, mode)
                 out.append(f"\n— {sym} —")
-                out.extend(reasons[:18])
+                out.extend(reasons[:22])
                 if sig:
+                    # покажем блокировки прямо в DIAG
+                    rep = repeated(sym, sig["hash16"])
+                    cd = sig["cooldown_min"]
+                    if mode == "FLOW" and sym == "XAU/USD":
+                        cd = min(cd, 40)
+                    cd_ok = cooldown_ok(sym, cd)
                     out.append(f"👉 Кандидат: {sig['setup']} {sig['direction']} score={sig['score']}")
+                    out.append(f"   block_check: repeat={rep} | cooldown_ok={cd_ok} (cd={cd}m)")
     except Exception as e:
         out.append(f"\n⚠️ DIAG error: {e}")
     return "\n".join(out)
@@ -864,7 +895,7 @@ def on_start(msg):
         msg.chat.id,
         "✅ Бот запущен.\n"
         "Фильтр: 4H(trend) → 1H(setup) → 15m(trigger) → 5m(confirm)\n"
-        "Сетапы: BREAKOUT + PULLBACK + CONTINUATION\n"
+        "Сетапы: BREAKOUT + PULLBACK + CONTINUATION + RANGE_BREAK\n"
         f"Инструменты: EUR/USD и XAU/USD\n"
         f"Сессия (UTC): {SESSION_START_UTC}:00–{SESSION_END_UTC}:00\n"
         f"Авто-анализ: каждые {AUTO_INTERVAL_MINUTES} минут\n"
