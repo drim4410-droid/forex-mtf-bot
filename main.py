@@ -45,8 +45,8 @@ N_MONITOR = 450
 DB_PATH = "bot.db"
 
 # =========================
-# MODES: FLOW/BALANCED/STRICT
-# (FLOW ослаблен по vol/rsi)
+# MODES
+# (FLOW ослаблен + 15m триггеры ослаблены)
 # =========================
 MODE_PARAMS: Dict[str, dict] = {
     "STRICT": {
@@ -78,14 +78,12 @@ MODE_PARAMS: Dict[str, dict] = {
         "rr": 1.60,
         "sl_atr_mult": 1.45,
         "cooldown_min": 70,
-        "breakout_n": 3,
-        "impulse_k": 0.60,
-        # было 0.00028 — слишком жестко (особенно для XAU)
-        "vol_thr_1h": 0.00018,
-        # было 48/54 — расширяем окно, чтобы 1H не валился
+        "breakout_n": 2,        # было 3 -> чаще пробои
+        "impulse_k": 0.45,      # было 0.60 -> мягче импульс
+        "vol_thr_1h": 0.00018,  # мягче vol
         "rsi_long_min": 46,
         "rsi_short_max": 56,
-        "pullback_dist_atr": 0.80,
+        "pullback_dist_atr": 1.20,  # было 0.80 -> pullback шире
     },
 }
 
@@ -377,11 +375,6 @@ def calc_pack(candles: List[Candle]) -> dict:
 # Strategy
 # =========================
 def bias_4h(c4: List[Candle]) -> Optional[str]:
-    """
-    Мягкий тренд bias для EUR/XAU:
-    - EMA50 vs EMA200 + наклон EMA50
-    - если тренд слабый, fallback по EMA200 + наклон EMA50
-    """
     if len(c4) < 220:
         return None
     p = calc_pack(c4)
@@ -392,22 +385,19 @@ def bias_4h(c4: List[Candle]) -> Optional[str]:
     if any(x != x for x in [ema50, ema200, ema50_prev]):
         return None
 
-    # Было 0.001 — слишком строго. Делаем мягче.
+    # мягче порог, чтобы EUR чаще имел bias
     if abs(ema50 - ema200) / max(1e-12, price) < 0.00045:
-        # fallback: слабый тренд
         if price > ema200 and ema50 >= ema50_prev:
             return "LONG"
         if price < ema200 and ema50 <= ema50_prev:
             return "SHORT"
         return None
 
-    # основной тренд
     if ema50 > ema200 and price > ema50 and ema50 > ema50_prev:
         return "LONG"
     if ema50 < ema200 and price < ema50 and ema50 < ema50_prev:
         return "SHORT"
 
-    # fallback на конец
     if price > ema200 and ema50 >= ema50_prev:
         return "LONG"
     if price < ema200 and ema50 <= ema50_prev:
@@ -418,23 +408,37 @@ def bias_4h(c4: List[Candle]) -> Optional[str]:
 def vol_ok(atr_val: float, price: float, thr: float) -> bool:
     return (atr_val == atr_val) and atr_val > 0 and (atr_val / max(1e-12, price)) > thr
 
-def setup_1h(c1: List[Candle], direction: str, mode: str) -> bool:
+# ✅ адаптивный 1H фильтр (особенно для XAU)
+def setup_1h(symbol: str, c1: List[Candle], direction: str, mode: str) -> bool:
     prm = MODE_PARAMS[mode]
     p = calc_pack(c1)
     price = p["closes"][-1]
+    ema20 = p["ema20"][-1]
     ema50 = p["ema50"][-1]
     rsi = p["rsi14"][-1]
     atr = p["atr14"][-1]
-    if any(x != x for x in [ema50, rsi, atr]):
+    if any(x != x for x in [ema20, ema50, rsi, atr]):
         return False
 
-    if not vol_ok(atr, price, prm["vol_thr_1h"]):
+    thr = prm["vol_thr_1h"]
+    if symbol == "XAU/USD":
+        thr *= 0.55  # золото часто валится на vol
+
+    if not vol_ok(atr, price, thr):
         return False
+
+    # Для XAU в FLOW допускаем EMA20 вместо EMA50
+    if mode == "FLOW" and symbol == "XAU/USD":
+        ema_ok_long = price > ema20
+        ema_ok_short = price < ema20
+    else:
+        ema_ok_long = price > ema50
+        ema_ok_short = price < ema50
 
     if direction == "LONG":
-        return price > ema50 and rsi >= prm["rsi_long_min"] and rsi <= 74
+        return ema_ok_long and rsi >= prm["rsi_long_min"] and rsi <= (78 if symbol == "XAU/USD" else 74)
     else:
-        return price < ema50 and rsi >= 26 and rsi <= prm["rsi_short_max"]
+        return ema_ok_short and rsi >= 26 and rsi <= prm["rsi_short_max"]
 
 def ema_confirm_5m(c5: List[Candle], direction: str) -> bool:
     p = calc_pack(c5)
@@ -488,7 +492,9 @@ def pullback_15m(c15: List[Candle], direction: str, mode: str) -> bool:
     last = c15[-1]
     body = abs(last.c - last.o)
     rng = max(1e-12, (last.h - last.l))
-    body_ok = (body / rng) >= 0.35
+
+    thr = 0.25 if mode == "FLOW" else 0.35
+    body_ok = (body / rng) >= thr
 
     if direction == "LONG":
         candle_ok = last.c > last.o
@@ -547,7 +553,6 @@ def build_signal(symbol: str, direction: str, c5: List[Candle], c15: List[Candle
     tp_r = round(tp, d)
 
     score = prm["score_base"] + (0.4 if setup == "BREAKOUT" else 0.15)
-
     h = sha16(f"{symbol}|{direction}|{entry_r}|{sl_r}|{tp_r}|{mode}|{setup}")
 
     return {
@@ -632,7 +637,7 @@ async def analyze_symbol(session: aiohttp.ClientSession, symbol: str, mode: str,
     reasons.append(f"✅ 4H bias: {direction}")
 
     c1 = await fetch_td(session, symbol, TF_1H, N_1H)
-    if not setup_1h(c1, direction, mode):
+    if not setup_1h(symbol, c1, direction, mode):
         reasons.append("❌ 1H: не прошёл фильтр (EMA/RSI/Vol)")
         return None, reasons
     reasons.append("✅ 1H: setup ok")
@@ -724,7 +729,7 @@ async def run_diag() -> str:
             for sym in INSTRUMENTS:
                 sig, reasons = await analyze_symbol(session, sym, mode, diag=True)
                 out.append(f"\n— {sym} —")
-                out.extend(reasons[:12])
+                out.extend(reasons[:14])
                 if sig:
                     out.append(f"👉 Кандидат: {sig['setup']} {sig['direction']} score={sig['score']}")
     except Exception as e:
@@ -734,7 +739,7 @@ async def run_diag() -> str:
 # =========================
 # Monitor TP/SL
 # =========================
-def candle_hits(sig: dict, candles: List[Candle]) -> Optional[str]:
+def candle_hits(sig: dict, candles: List["Candle"]) -> Optional[str]:
     tp = float(sig["tp"])
     sl = float(sig["sl"])
     direction = sig["direction"]
